@@ -1,0 +1,194 @@
+// src/client.ts
+import axios, { AxiosInstance, AxiosError } from 'axios';
+import pino from 'pino';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+// ---- 1. Типы данных (экспортируются) ----
+export interface MessageItem {
+  message_id: string;
+  in_reply_to?: string;
+  references: string[];
+  subject: string;
+  from: string;
+  to: string[];
+  sent_at: string;
+}
+
+export interface FetchResponse {
+  items: MessageItem[];
+  next_cursor: string | null;
+}
+
+// ---- 2. Внутренняя конфигурация ----
+interface ClientConfig {
+  baseURL: string;
+  requestTimeout: number;
+  maxRetries: number;
+  baseDelay: number;
+  maxDelay: number;
+  totalOperationTimeout: number;
+}
+
+const config: ClientConfig = {
+  baseURL: process.env.PROVIDER_URL || 'http://localhost:8080',
+  requestTimeout: Number(process.env.REQUEST_TIMEOUT) || 30000,
+  maxRetries: Number(process.env.MAX_RETRIES) || 5,
+  baseDelay: Number(process.env.BASE_DELAY) || 1000,
+  maxDelay: Number(process.env.MAX_DELAY) || 30000,
+  totalOperationTimeout: Number(process.env.TOTAL_OPERATION_TIMEOUT) || 120000,
+};
+
+// ---- 3. Логгер (корневой) ----
+const rootLogger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  formatters: { level: (label) => ({ level: label }) },
+  timestamp: pino.stdTimeFunctions.isoTime,
+});
+
+// ---- 4. Вспомогательные функции (внутренние) ----
+function generateRequestId(): string {
+  return `req-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getDelay(attempt: number, baseDelay: number, maxDelay: number): number {
+  const exponential = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
+  const jitter = exponential * (0.8 + 0.4 * Math.random()); // ±20%
+  return Math.min(jitter, maxDelay);
+}
+
+function parseRetryAfter(header: string | undefined): number | null {
+  if (!header) return null;
+  const trimmed = header.trim();
+  // Если число секунд
+  if (/^\d+$/.test(trimmed)) {
+    return parseInt(trimmed, 10) * 1000;
+  }
+  // Если HTTP-дата
+  const date = new Date(trimmed);
+  if (!isNaN(date.getTime())) {
+    const delta = date.getTime() - Date.now();
+    return delta > 0 ? delta : 0;
+  }
+  return null;
+}
+
+// ---- 5. Axios-инстанс ----
+const axiosInstance: AxiosInstance = axios.create({
+  baseURL: config.baseURL,
+  timeout: config.requestTimeout,
+  headers: { 'Accept': 'application/json' },
+});
+
+// (Опционально) интерцепторы для отладки – можно добавить позже
+
+// ---- 6. Основная функция fetchMessages (экспортируемая) ----
+export async function fetchMessages(
+  cursor?: string,
+  limit: number = 200
+): Promise<FetchResponse> {
+  const requestId = generateRequestId();
+  const logger = rootLogger.child({ requestId, cursor, limit });
+
+  logger.info('Starting fetchMessages');
+
+  const operationTimeout = config.totalOperationTimeout;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(new Error(`Operation timed out after ${operationTimeout}ms`));
+    }, operationTimeout);
+  });
+
+  const fetchPromise = (async () => {
+    let attempt = 0;
+    let lastError: Error | null = null;
+
+    while (attempt <= config.maxRetries) {
+      try {
+        logger.debug({ attempt }, `Attempt ${attempt + 1}/${config.maxRetries + 1}`);
+
+        const params: Record<string, string | number> = { limit };
+        if (cursor) {
+          params.cursor = cursor;
+        }
+
+        const response = await axiosInstance.get('/v1/messages', { params });
+
+        if (response.status !== 200) {
+          throw new Error(`Unexpected status ${response.status}`);
+        }
+
+        const data = response.data;
+        if (!data || typeof data !== 'object') {
+          throw new Error('Response body is not an object');
+        }
+        if (!Array.isArray(data.items)) {
+          throw new Error('Response missing "items" array');
+        }
+        if (!('next_cursor' in data)) {
+          throw new Error('Response missing "next_cursor" field');
+        }
+
+        const items = data.items as MessageItem[];
+        const nextCursor = data.next_cursor as string | null;
+
+        logger.info({ itemsCount: items.length, nextCursor }, 'Fetch succeeded');
+        return { items, next_cursor: nextCursor };
+      } catch (error) {
+        lastError = error as Error;
+        const isAxios = axios.isAxiosError(error);
+        const axiosError = isAxios ? (error as AxiosError) : null;
+        const status = axiosError?.response?.status;
+        const headers = axiosError?.response?.headers;
+
+        if (attempt < config.maxRetries) {
+          let delayMs: number | null = null;
+
+          if (status === 429) {
+            const retryAfterHeader = headers?.['retry-after'] || headers?.['Retry-After'];
+            const parsed = parseRetryAfter(retryAfterHeader as string | undefined);
+            if (parsed !== null) {
+              delayMs = parsed;
+              logger.warn({ attempt, retryAfter: parsed }, 'Received 429, waiting Retry-After');
+            } else {
+              delayMs = getDelay(attempt, config.baseDelay * 2, config.maxDelay);
+              logger.warn({ attempt, delayMs }, '429 without Retry-After, using backoff');
+            }
+          } else if (status && status >= 500 && status < 600) {
+            delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
+            logger.warn({ attempt, status, delayMs }, `Server error ${status}, retrying`);
+          } else if (
+            axiosError?.code === 'ECONNABORTED' ||
+            axiosError?.code === 'ETIMEDOUT' ||
+            axiosError?.code === 'ENOTFOUND' ||
+            axiosError?.code === 'ECONNREFUSED'
+          ) {
+            delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
+            logger.warn({ attempt, code: axiosError.code, delayMs }, 'Network/timeout error, retrying');
+          } else {
+            delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
+            logger.warn({ attempt, error: axiosError?.message || String(error), delayMs }, 'Unexpected error, retrying');
+          }
+
+          if (delayMs !== null && delayMs > 0) {
+            await sleep(delayMs);
+          }
+        } else {
+          logger.error({ attempt, error: lastError.message }, 'Max retries exceeded, throwing');
+          throw lastError;
+        }
+
+        attempt++;
+      }
+    }
+
+    throw lastError || new Error('Fetch failed after all retries');
+  })();
+
+  return Promise.race([fetchPromise, timeoutPromise]);
+}

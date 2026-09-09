@@ -1,0 +1,33 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Message {
+  id          Int      @id @default(autoincrement())
+  externalId  String   @unique
+  inReplyTo   String?
+  references  String[]
+  subject     String
+  fromAddr    String
+  toAddrs     String[]
+  sentAt      DateTime
+  parentId    String?
+  threadKey   String?
+  createdAt   DateTime @default(now())
+
+  @@map("messages")
+}
+
+model AppState {
+  key   String @id
+  value String
+
+  @@map("app_state")
+}

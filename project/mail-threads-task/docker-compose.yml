@@ -1,0 +1,32 @@
+# Почтовый сервис для тестового задания.
+# Свои службы дописывайте в этот же файл.
+# Обязательные имена служб: worker и exporter.
+
+services:
+  provider:
+    # Образ скачивается сам при первом запуске, собирать его не нужно.
+    image: ${PROVIDER_IMAGE:-gitea.teamlead.one/armanteam_public/mail-provider:1}
+    environment:
+      CANDIDATE: ${CANDIDATE:?укажите CANDIDATE в файле .env}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:8080/v1/metrics').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  # Пример подключения своей службы:
+  #
+  # worker:
+  #   build: .
+  #   depends_on:
+  #     provider:
+  #       condition: service_healthy
+  #   environment:
+  #     PROVIDER_URL: http://provider:8080
