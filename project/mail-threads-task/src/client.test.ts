@@ -27,14 +27,6 @@ jest.mock('pino', () => {
 });
 
 
-// Переопределяем переменные окружения для тестов (можно также использовать jest.mock('dotenv'))
-process.env.PROVIDER_URL = 'http://test-provider';
-process.env.REQUEST_TIMEOUT = '1000';
-process.env.MAX_RETRIES = '3';
-process.env.BASE_DELAY = '100';
-process.env.MAX_DELAY = '500';
-process.env.TOTAL_OPERATION_TIMEOUT = '5000';
-process.env.LOG_LEVEL = 'silent';
 
 // Утилита для создания валидного ответа
 function createValidResponse(items: Partial<MessageItem>[] = [], nextCursor: string | null = null): any {
@@ -54,11 +46,9 @@ function createValidResponse(items: Partial<MessageItem>[] = [], nextCursor: str
 
 describe('fetchMessages', () => {
   beforeEach(() => {
+    nock.cleanAll();
     nock.disableNetConnect();
-
-    // nock.cleanAll();
-    // jest.clearAllMocks();
-    // jest.useFakeTimers();
+    jest.clearAllMocks();
   });
 
   afterAll(() => {
@@ -119,7 +109,7 @@ describe('fetchMessages', () => {
       nock(baseUrl)
         .get('/v1/messages')
         .query({ limit: '200' })
-        .reply(429, {}, { 'Retry-After': '2' });
+        .reply(429, {}, { 'Retry-After': '0' });
       // Второй запрос: успех
       const successData = createValidResponse([{ message_id: 'retried' }], null);
       nock(baseUrl)
@@ -128,15 +118,15 @@ describe('fetchMessages', () => {
         .reply(200, successData);
 
       const promise = fetchMessages();
-      // Продвигаем время на 2 секунды + небольшой запас
-      // jest.advanceTimersByTime(2000);
+
+
       const result = await promise;
       expect(result.items[0].message_id).toBe('retried');
       expect(nock.isDone()).toBe(true);
     });
 
     it('should retry after Retry-After as HTTP date', async () => {
-      const futureDate = new Date(Date.now() + 3000).toUTCString();
+      const futureDate = new Date(Date.now() + 50).toUTCString();
       nock(baseUrl)
         .get('/v1/messages')
         .query({ limit: '200' })
@@ -148,7 +138,7 @@ describe('fetchMessages', () => {
         .reply(200, successData);
 
       const promise = fetchMessages();
-      jest.advanceTimersByTime(3000);
+
       const result = await promise;
       expect(result.items[0].message_id).toBe('date-retried');
     });
@@ -174,7 +164,6 @@ describe('fetchMessages', () => {
       const promise = fetchMessages();
       // Ожидаем задержку: первая попытка (attempt=0) -> baseDelay * 2 = 200ms, вторая (attempt=1) -> baseDelay * 2^2 = 400ms (с джиттером, но мы форсируем)
       // Чтобы тест был детерминированным, мы можем замокать getDelay, но проще продвинуть время на достаточную сумму.
-      jest.advanceTimersByTime(200 + 400 + 100); // + небольшая погрешность
       const result = await promise;
       expect(result.items[0].message_id).toBe('backoff');
     });
@@ -193,7 +182,6 @@ describe('fetchMessages', () => {
         .reply(200, createValidResponse([{ message_id: 'after-500' }], null));
 
       const promise = fetchMessages();
-      jest.advanceTimersByTime(100); // baseDelay
       const result = await promise;
       expect(result.items[0].message_id).toBe('after-500');
     });
@@ -209,7 +197,6 @@ describe('fetchMessages', () => {
         .reply(200, createValidResponse([{ message_id: 'after-503' }], null));
 
       const promise = fetchMessages();
-      jest.advanceTimersByTime(100);
       const result = await promise;
       expect(result.items[0].message_id).toBe('after-503');
     });
@@ -228,7 +215,6 @@ describe('fetchMessages', () => {
         .reply(200, createValidResponse([{ message_id: 'conn-refused' }], null));
 
       const promise = fetchMessages();
-      jest.advanceTimersByTime(100);
       const result = await promise;
       expect(result.items[0].message_id).toBe('conn-refused');
     });
@@ -244,7 +230,7 @@ describe('fetchMessages', () => {
         .reply(200, createValidResponse([{ message_id: 'timeout' }], null));
 
       const promise = fetchMessages();
-      jest.advanceTimersByTime(100);
+
       const result = await promise;
       expect(result.items[0].message_id).toBe('timeout');
     });
@@ -260,7 +246,7 @@ describe('fetchMessages', () => {
         .reply(200, createValidResponse([{ message_id: 'notfound' }], null));
 
       const promise = fetchMessages();
-      jest.advanceTimersByTime(100);
+
       const result = await promise;
       expect(result.items[0].message_id).toBe('notfound');
     });
@@ -276,7 +262,7 @@ describe('fetchMessages', () => {
         .reply(200, createValidResponse([{ message_id: 'aborted' }], null));
 
       const promise = fetchMessages();
-      jest.advanceTimersByTime(100);
+
       const result = await promise;
       expect(result.items[0].message_id).toBe('aborted');
     });
@@ -331,19 +317,23 @@ describe('fetchMessages', () => {
       // Установим общий таймаут = 2000 мс, а ответ будет приходить через 3000 мс.
       // Но nock не поддерживает задержку ответа легко. Используем другой подход: замокаем sleep и getDelay, чтобы они не продвигали время.
       // Мы можем использовать jest.advanceTimersByTime и проверить, что после превышения таймаута выбрасывается ошибка.
+      //  c  jest.advanceTimersByTime проблема и их убрали
       // Для этого создадим сценарий, где все попытки будут неудачными, а задержки будут превышать общий таймаут.
       // Установим MAX_RETRIES=5, BASE_DELAY=1000, TOTAL_OPERATION_TIMEOUT=2000.
       // Тогда после двух попыток (0 и 1) общее время превысит 2000.
-      process.env.TOTAL_OPERATION_TIMEOUT = '2000';
-      process.env.BASE_DELAY = '1000';
-      process.env.MAX_RETRIES = '5';
 
-      // Все запросы будут возвращать 500
-      nock(baseUrl)
-        .get('/v1/messages')
-        .query({ limit: '200' })
-        .times(10)
-        .reply(500);
+
+      jest.resetModules();
+      process.env.TOTAL_OPERATION_TIMEOUT = '100';
+      process.env.BASE_DELAY = '500';
+
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { fetchMessages: fetch2 } = require('./client');
+
+      nock(baseUrl).get('/v1/messages').query({ limit: '200' }).reply(500);
+
+      await expect(fetch2()).rejects.toThrow(/Operation timed out/);
+
 
       // Пересоздаём клиент? Лучше перезагрузить модуль, чтобы применились новые переменные.
       // Вместо этого мы можем переопределить конфиг внутри теста через jest.resetModules и повторный импорт.
@@ -356,7 +346,9 @@ describe('fetchMessages', () => {
       // nock не умеет задерживать ответ, но мы можем использовать axios interceptors или просто замокать axiosInstance.
       // Оставлю этот тест как "не реализован", но можно пропустить.
       // В реальном проекте такой тест важен, но из-за сложности с fake timers и nock предлагаю пропустить.
-      expect(true).toBe(true);
+
+      // expect(true).toBe(true);
+
     });
   });
 
@@ -369,7 +361,7 @@ describe('fetchMessages', () => {
       nock(baseUrl)
         .get('/v1/messages')
         .query({ limit: '200' })
-        .times(3)
+        .times(4)
         .reply(500);
 
       // Перезагружаем модуль, чтобы применить новые настройки? Но мы уже изменили process.env, но конфиг уже прочитан при первом импорте.
