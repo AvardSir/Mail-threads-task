@@ -83,6 +83,8 @@ const axiosInstance: AxiosInstance = axios.create({
   baseURL: config.baseURL,
   timeout: config.requestTimeout,
   headers: { 'Accept': 'application/json' },
+  maxRedirects: 0,   // ← добавить: нам нужен именно ответ провайдера
+
 });
 
 // (Опционально) интерцепторы для отладки – можно добавить позже
@@ -140,56 +142,70 @@ export async function fetchMessages(
         logger.info({ itemsCount: items.length, nextCursor }, 'Fetch succeeded');
         return { items, next_cursor: nextCursor };
       } catch (error) {
-        // Валидационные ошибки (мы бросаем их сами) не ретраятся
+        // 1) Ошибки валидации (мы их бросаем сами) — сразу наружу, без retry
         if (!axios.isAxiosError(error)) {
           logger.error({ error: (error as Error).message }, 'Non-retryable error');
           throw error;
         }
 
-        lastError = error as Error;
         const axiosError = error as AxiosError;
         const status = axiosError.response?.status;
         const headers = axiosError.response?.headers;
 
-        if (attempt < config.maxRetries) {
-          let delayMs: number | null = null;
+        // 2) Классифицируем ошибку
+        const isRateLimit = status === 429;
+        const isServerError = status !== undefined && status >= 500 && status < 600;
+        const isNetworkError =
+          axiosError.code === 'ECONNABORTED' ||
+          axiosError.code === 'ETIMEDOUT' ||
+          axiosError.code === 'ENOTFOUND' ||
+          axiosError.code === 'ECONNREFUSED';
 
-          if (status === 429) {
-            const retryAfterHeader = headers?.['retry-after'] || headers?.['Retry-After'];
-            const parsed = parseRetryAfter(retryAfterHeader as string | undefined);
-            if (parsed !== null) {
-              delayMs = parsed;
-              logger.warn({ attempt, retryAfter: parsed }, 'Received 429, waiting Retry-After');
-            } else {
-              delayMs = getDelay(attempt, config.baseDelay * 2, config.maxDelay);
-              logger.warn({ attempt, delayMs }, '429 without Retry-After, using backoff');
-            }
-          } else if (status && status >= 500 && status < 600) {
-            delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
-            logger.warn({ attempt, status, delayMs }, `Server error ${status}, retrying`);
-          } else if (
-            axiosError.code === 'ECONNABORTED' ||
-            axiosError.code === 'ETIMEDOUT' ||
-            axiosError.code === 'ENOTFOUND' ||
-            axiosError.code === 'ECONNREFUSED'
-          ) {
-            delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
-            logger.warn({ attempt, code: axiosError.code, delayMs }, 'Network/timeout error, retrying');
-          } else {
-            delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
-            logger.warn({ attempt, error: axiosError.message, delayMs }, 'Unexpected axios error, retrying');
-          }
+        const isRetryable = isRateLimit || isServerError || isNetworkError;
 
-          if (delayMs !== null && delayMs > 0) {
-            await sleep(delayMs);
-          }
-        } else {
+        // 3) Всё остальное (3xx, 4xx кроме 429, прочее) — не ретраить
+        if (!isRetryable) {
+          logger.error(
+            { status, code: axiosError.code, error: axiosError.message },
+            'Non-retryable axios error'
+          );
+          throw error;
+        }
+
+        lastError = error as Error;
+
+        // 4) Если попытки кончились — бросаем последнюю ошибку
+        if (attempt >= config.maxRetries) {
           logger.error({ attempt, error: lastError.message }, 'Max retries exceeded, throwing');
           throw lastError;
         }
 
+        // 5) Считаем задержку и спим
+        let delayMs: number;
+        if (isRateLimit) {
+          const retryAfterHeader = headers?.['retry-after'] || headers?.['Retry-After'];
+          const parsed = parseRetryAfter(retryAfterHeader as string | undefined);
+          if (parsed !== null) {
+            delayMs = parsed;
+            logger.warn({ attempt, retryAfter: parsed }, 'Received 429, waiting Retry-After');
+          } else {
+            delayMs = getDelay(attempt, config.baseDelay * 2, config.maxDelay);
+            logger.warn({ attempt, delayMs }, '429 without Retry-After, using backoff');
+          }
+        } else if (isServerError) {
+          delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
+          logger.warn({ attempt, status, delayMs }, `Server error ${status}, retrying`);
+        } else {
+          delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
+          logger.warn({ attempt, code: axiosError.code, delayMs }, 'Network error, retrying');
+        }
+
+        if (delayMs > 0) {
+          await sleep(delayMs);
+        }
         attempt++;
       }
+
 
     }
 

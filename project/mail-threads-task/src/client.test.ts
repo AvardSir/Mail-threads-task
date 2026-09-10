@@ -303,7 +303,7 @@ describe('fetchMessages', () => {
         .query({ limit: '200' })
         .reply(302, {});
 
-      await expect(fetchMessages()).rejects.toThrow('Unexpected status 302');
+      await expect(fetchMessages()).rejects.toThrow('status code 302');
     });
   });
 
