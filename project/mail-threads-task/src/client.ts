@@ -140,11 +140,16 @@ export async function fetchMessages(
         logger.info({ itemsCount: items.length, nextCursor }, 'Fetch succeeded');
         return { items, next_cursor: nextCursor };
       } catch (error) {
+        // Валидационные ошибки (мы бросаем их сами) не ретраятся
+        if (!axios.isAxiosError(error)) {
+          logger.error({ error: (error as Error).message }, 'Non-retryable error');
+          throw error;
+        }
+
         lastError = error as Error;
-        const isAxios = axios.isAxiosError(error);
-        const axiosError = isAxios ? (error as AxiosError) : null;
-        const status = axiosError?.response?.status;
-        const headers = axiosError?.response?.headers;
+        const axiosError = error as AxiosError;
+        const status = axiosError.response?.status;
+        const headers = axiosError.response?.headers;
 
         if (attempt < config.maxRetries) {
           let delayMs: number | null = null;
@@ -163,16 +168,16 @@ export async function fetchMessages(
             delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
             logger.warn({ attempt, status, delayMs }, `Server error ${status}, retrying`);
           } else if (
-            axiosError?.code === 'ECONNABORTED' ||
-            axiosError?.code === 'ETIMEDOUT' ||
-            axiosError?.code === 'ENOTFOUND' ||
-            axiosError?.code === 'ECONNREFUSED'
+            axiosError.code === 'ECONNABORTED' ||
+            axiosError.code === 'ETIMEDOUT' ||
+            axiosError.code === 'ENOTFOUND' ||
+            axiosError.code === 'ECONNREFUSED'
           ) {
             delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
             logger.warn({ attempt, code: axiosError.code, delayMs }, 'Network/timeout error, retrying');
           } else {
             delayMs = getDelay(attempt, config.baseDelay, config.maxDelay);
-            logger.warn({ attempt, error: axiosError?.message || String(error), delayMs }, 'Unexpected error, retrying');
+            logger.warn({ attempt, error: axiosError.message, delayMs }, 'Unexpected axios error, retrying');
           }
 
           if (delayMs !== null && delayMs > 0) {
@@ -185,6 +190,7 @@ export async function fetchMessages(
 
         attempt++;
       }
+
     }
 
     throw lastError || new Error('Fetch failed after all retries');

@@ -310,77 +310,50 @@ describe('fetchMessages', () => {
   // --- 6. Общий таймаут операции ---
   describe('operation timeout', () => {
     it('should throw if total operation time exceeds TOTAL_OPERATION_TIMEOUT', async () => {
-      // Имитируем бесконечную задержку ответа: nock будет ждать, но мы не отвечаем
-      // Однако axios имеет свой таймаут (REQUEST_TIMEOUT=1000ms), поэтому нам нужно заставить его ждать дольше.
-      // Проще: замокать axiosInstance.get, чтобы он не резолвился, а использовал setTimeout.
-      // Но мы можем использовать nock с задержкой ответа.
-      // Установим общий таймаут = 2000 мс, а ответ будет приходить через 3000 мс.
-      // Но nock не поддерживает задержку ответа легко. Используем другой подход: замокаем sleep и getDelay, чтобы они не продвигали время.
-      // Мы можем использовать jest.advanceTimersByTime и проверить, что после превышения таймаута выбрасывается ошибка.
-      //  c  jest.advanceTimersByTime проблема и их убрали
-      // Для этого создадим сценарий, где все попытки будут неудачными, а задержки будут превышать общий таймаут.
-      // Установим MAX_RETRIES=5, BASE_DELAY=1000, TOTAL_OPERATION_TIMEOUT=2000.
-      // Тогда после двух попыток (0 и 1) общее время превысит 2000.
-
-
       jest.resetModules();
       process.env.TOTAL_OPERATION_TIMEOUT = '100';
-      process.env.BASE_DELAY = '500';
+
+      jest.doMock('axios', () => {
+        const actual = jest.requireActual('axios');
+        return {
+          ...actual,
+          default: {
+            ...actual.default,
+            create: () => ({
+              get: () => new Promise(() => { /* висит вечно */ }),
+            }),
+            isAxiosError: actual.default.isAxiosError,
+          },
+          create: () => ({
+            get: () => new Promise(() => { }),
+          }),
+          isAxiosError: actual.default.isAxiosError,
+        };
+      });
 
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { fetchMessages: fetch2 } = require('./client');
-
-      nock(baseUrl).get('/v1/messages').query({ limit: '200' }).reply(500);
-
       await expect(fetch2()).rejects.toThrow(/Operation timed out/);
 
-
-      // Пересоздаём клиент? Лучше перезагрузить модуль, чтобы применились новые переменные.
-      // Вместо этого мы можем переопределить конфиг внутри теста через jest.resetModules и повторный импорт.
-      // Но проще оставить как есть и использовать реальный таймаут.
-      // Однако тест станет долгим. Вместо этого мы можем замокать setTimeout и проверить, что ошибка выбрасывается через Promise.race.
-      // Лучше написать отдельный тест, который использует реальный таймаут, но ускорить его путём уменьшения значений.
-      // Для упрощения опустим этот тест, так как он сложен в реализации с fake timers.
-      // Вместо этого проверим, что функция выбрасывает ошибку, если общий таймаут истекает.
-      // Сделаем так: устанавливаем общий таймаут 100ms, а первая попытка занимает 200ms (например, через задержку в ответе).
-      // nock не умеет задерживать ответ, но мы можем использовать axios interceptors или просто замокать axiosInstance.
-      // Оставлю этот тест как "не реализован", но можно пропустить.
-      // В реальном проекте такой тест важен, но из-за сложности с fake timers и nock предлагаю пропустить.
-
-      // expect(true).toBe(true);
-
+      jest.dontMock('axios');
+      jest.resetModules();
     });
+
   });
 
   // --- 7. Исчерпание попыток ---
   describe('max retries exhausted', () => {
     it('should throw the last error after all retries', async () => {
-      // Устанавливаем MAX_RETRIES = 2 (итого 3 попытки)
-      process.env.MAX_RETRIES = '2';
-      // Все запросы будут возвращать 500
+      const maxRetries = Number(process.env.MAX_RETRIES); // из jest.setup.ts
       nock(baseUrl)
         .get('/v1/messages')
         .query({ limit: '200' })
-        .times(4)
-        .reply(500);
-
-      // Перезагружаем модуль, чтобы применить новые настройки? Но мы уже изменили process.env, но конфиг уже прочитан при первом импорте.
-      // Лучше перезагрузить модуль с помощью jest.isolateModules или jest.resetModules.
-      // Просто пересоздадим клиент, но это сложно.
-      // Вместо этого можем явно задать config через мок, но проще использовать текущие настройки (MAX_RETRIES=3 по умолчанию).
-      // Оставим как есть, но проверим, что после 4 попыток (0-3) выбрасывается ошибка.
-      // Используем исходные настройки: MAX_RETRIES=3 -> попытки 0,1,2,3 (4 попытки). Поэтому nock должен ответить 4 раза.
-      // Удалим предыдущие nock и создадим новые.
-      nock.cleanAll();
-      nock(baseUrl)
-        .get('/v1/messages')
-        .query({ limit: '200' })
-        .times(4)
+        .times(maxRetries + 1)   // попытки 0..maxRetries
         .reply(500);
 
       await expect(fetchMessages()).rejects.toThrow('Request failed with status code 500');
-      // Проверяем, что было 4 вызова
       expect(nock.isDone()).toBe(true);
     });
+
   });
 });
