@@ -4,10 +4,11 @@
   "description": "Есть почтовый сервис с API. Через него можно постранично выгрузить все письма — исходные сообщения и ответы на них, одной общей лентой.",
   "main": "selfcheck.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
     "start": "node dist/worker.js",
-    "dev": "nodemon --exec ts-node src/worker.ts"
+    "dev": "nodemon --exec ts-node src/worker.ts",
+    "test": "jest",
+    "test:watch": "jest --watch"
   },
   "repository": {
     "type": "git",
@@ -18,13 +19,17 @@
   "license": "ISC",
   "type": "commonjs",
   "devDependencies": {
-    "@types/axios": "^0.9.36",
+    "@types/jest": "^30.0.0",
+    "@types/nock": "^10.0.3",
     "@types/node": "^26.4.1",
+    "jest": "^30.5.1",
+    "nock": "^14.0.17",
     "nodemon": "^3.1.14",
     "prisma": "^5.22.0",
+    "ts-jest": "^29.4.12",
     "ts-node": "^10.9.2",
     "tsx": "^4.23.13",
-    "typescript": "^7.0.2"
+    "typescript": "^5.4.5"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
