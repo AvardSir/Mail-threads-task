@@ -15,22 +15,23 @@ Retry	ручной (while + sleep)
 Env	dotenv
 Тесты	jest + nock
 Тест-таймеры	реальные (НЕ jest.useFakeTimers)
+
 3. 📁 Структура
-text
 project/
 ├── .env                    ← боевой конфиг (в .gitignore)
 ├── jest.config.js          ← setupFiles: ['<rootDir>/jest.setup.ts']
 ├── jest.setup.ts           ← env-переменные для тестов (в git)
 └── src/
-    ├── client.ts           ← HTTP-клиент (Веха 3)
-    ├── client.test.ts
-    ├── prisma.ts           ← shared PrismaClient
-    ├── db.ts               ← слой БД (Веха 4)
-    ├── db.test.ts
-    ├── worker.ts           ← основной цикл (Веха 5)
-    ├── worker.test.ts
-    ├── processor.ts        ← постобработка (стаб Веха 5, тело Веха 6)
-    └── exporter.ts         ← экспорт JSONL (стаб Веха 5, тело Веха 7)
+    ├── client.ts           ← HTTP-клиент (Веха 3) ✅
+    ├── client.test.ts      ← ✅
+    ├── prisma.ts           ← shared PrismaClient (Веха 4) ✅
+    ├── db.ts               ← слой БД (Веха 4) ✅
+    ├── db.test.ts          ← ✅
+    ├── worker.ts           ← основной цикл (Веха 5) ✅
+    ├── worker.test.ts      ← ✅
+    ├── processor.ts        ← постобработка (Веха 6) ✅
+    ├── processor.test.ts   ← ✅ 27 тестов
+    └── exporter.ts         ← экспорт JSONL (стаб Веха 5, тело — Веха 7) ⏳
 
 4. ⚙️ Конфиг: правила игры
 4.1 Env-переменные читаются один раз при импорте модуля
@@ -56,6 +57,7 @@ BASE_DELAY              = '10'      // маленькие! иначе тесты
 MAX_DELAY               = '500'
 TOTAL_OPERATION_TIMEOUT = '5000'
 LOG_LEVEL               = 'silent'
+
 5. 🌐 Axios: жёсткие правила
 ts
 axios.create({
@@ -170,6 +172,7 @@ jest.resetModules();
 | response validation   | 4 кейса из §7                                       |
 | operation timeout     | мок axios с вечно висящим get()                     |
 | max retries exhausted | .times(maxRetries + 1) × 500                        |
+
 10. 📝 Стиль кода
 Только стрелки и async/await, никаких .then().
 
@@ -201,7 +204,9 @@ jest.resetModules();
 10	Env в боевом .env ≠ env для тестов	для тестов — jest.setup.ts
 11	@@map в Prisma	в raw SQL и TRUNCATE — имена таблиц ("messages", "app_state"), не моделей
 | 12 | Два MessageItem — в client.ts и db.ts | Разные shape'ы под одним именем: ClientMessageItem (message_id/from/to/sent_at/in_reply_to) vs DbMessageItem (externalId/fromAddr/toAddrs/sentAt/inReplyTo). Импортировать через алиасы; маппинг — только в worker.ts → mapClientToDb |
-
+| 13 | MessageRow.references: string[] — НЕ nullable, inReplyTo: string \| null | в processor.ts фильтр пустых/null всё равно нужен для inReplyTo; не писать `m.references ?? []` |
+| 14 | DSU: корень = target в union(child, target) | обходить links в обратном порядке `[inReplyTo, references[last], …, references[0]]` — тогда корнем становится `references[0]`; мёртвые id из links тоже становятся узлами DSU |
+| 15 | processor.ts — чистая функция без БД, HTTP, логгера | `buildUpdates(messages, existingIds) → UpdateThreadInput[]`; self-reference (`m.externalId`) исключается и из parentId, и из union |
 
 12. 🎓 TL;DR
 Клиент — это один модуль с одной функцией.
@@ -209,8 +214,7 @@ jest.resetModules();
 Retry — только для транзиентных ошибок, всё остальное — сразу наружу.
 Тесты — nock + реальные таймеры + маленькие задержки через setup-файл.
 Стиль — строгий TypeScript, явные типы, точные сообщения об ошибках.
-
-
+Processor — DSU + скан parentId с конца; никакой БД и логов.
 
 13. 🧪 TDD-практика (жёсткий протокол)
 
@@ -346,8 +350,8 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
 | 3   | HTTP-клиент с обработкой ошибок | src/client.ts, src/client.test.ts, jest.config.js, jest.setup.ts  | ✅           |
 | 4   | Слой БД                         | src/db.ts, src/db.test.ts, src/prisma.ts                          | ✅           |
 | 5   | Основной цикл (worker)          | src/worker.ts, src/worker.test.ts, стабы processor.ts/exporter.ts | ✅           |
-| 6   | Постобработка                   | src/processor.ts (parent_id, thread_key через DSU)                | 🔄 следующая |
-| 7   | Экспорт                         | src/exporter.ts → ./out/result.jsonl                              | ⏳           |
+| 6   | Постобработка                   | src/processor.ts, src/processor.test.ts (parent_id, thread_key)   | ✅           |
+| 7   | Экспорт                         | src/exporter.ts → ./out/result.jsonl                              | 🔄 следующая |
 | 8   | Production Docker               | Dockerfile, docker-compose.yml (db + worker + exporter)           | ⏳           |
 | 9   | E2E-прогон                      | Полный цикл: load → process → export                              | ⏳           |
 | 10  | Документация                    | README, инструкция запуска, переменные окружения                  | ⏳           |
@@ -362,6 +366,14 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
   созданы в финальных контрактах §14.4/§14.5 — тела заглушки, наполняются
   в Вехах 6/7 без переписывания тестов worker.ts.
   Все 50 тестов (client + db + worker) зелёные.
+  Предсказание подтвердилось на Вехе 6: наполнение processor.ts не потребовало
+  ни одной правки в worker.test.ts (16/16 остались зелёными).
+- Веха 6 завершена: src/processor.ts реализован (27/27 тестов зелёных).
+  Полный прогон — 4 сьюта, 77/77 зелёных (client + db + worker + processor).
+  Реализация: DSU для thread_key (union(child, target) → target становится
+  корнем, links обходятся в обратном порядке), parent_id — скан с конца
+  [references..., inReplyTo], self-reference исключён. Чистая функция без БД,
+  HTTP и логгера. client.ts / db.ts / worker.ts не тронуты.
 - Все ограничения и грабли Вехи 3 зафиксированы в §4–§11 — источник истины
   для клиента, менять их без причины нельзя.
 
@@ -380,9 +392,12 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
 - Локально рекомендуется `npm test -- --runInBand`, пока db.test.ts
   и worker.test.ts делят одну БД — иначе гонка на TRUNCATE.
 
-- Следующий шаг — Веха 6 (src/processor.ts). Работаем по TDD (§13):
+- Следующий шаг — Веха 7 (src/exporter.ts). Работаем по TDD (§13):
   Запрос 1 — план, Запрос 2 — тесты (Red), Запрос 3 — реализация (Green).
-  
+  Перед Запросом 1 уточнить у пользователя: порядок строк (id vs externalId),
+  поведение при пустом результате, формат sentAt, создание ./out/, стратегия
+  тестирования ФС (tmpdir + аргумент outputPath vs мок fs).
+
 14.2. Что должно быть в Вехе 4 (db.ts)
 Публичный контракт (обязателен, из §3.1 исходного ТЗ):
 
@@ -396,6 +411,17 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
 
 Дополнительно экспортируются типы: MessageItem, MessageRow, UpdateThreadInput.
 
+MessageRow (источник истины для processor):
+  id: number;
+  externalId: string;
+  parentId: string | null;
+  threadKey: string | null;
+  subject: string | null;
+  fromAddr: string | null;
+  toAddrs: string[];
+  sentAt: Date | null;
+  references: string[];        // не nullable
+  inReplyTo: string | null;
 
 Правила:
 - saveMessages — идемпотентна: дубликаты по externalId пропускаем (skipDuplicates).
@@ -405,7 +431,8 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
   с TRUNCATE в beforeEach. Мокать Prisma нельзя — иначе теряется смысл слоя.
 - Таблицы в БД называются по @@map: "messages" и "app_state". В raw SQL и в
   TRUNCATE использовать именно эти имена, а не имена моделей Prisma
-  (Message/AppState) — иначе relation does not exist.- Никакой бизнес-логики в db.ts: только доступ к данным.
+  (Message/AppState) — иначе relation does not exist.
+- Никакой бизнес-логики в db.ts: только доступ к данным.
 
 14.3. Что должно быть в Вехе 5 (worker.ts)
 
@@ -427,13 +454,14 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
 - runWorker только resolve/throw. process.exit — только в CLI-обёртке
   под `require.main === module`.
 - Маппинг ClientMessageItem → DbMessageItem — приватный хелпер mapClientToDb.
-  client.ts и db.ts не трогаем .
+  client.ts и db.ts не трогаем.
 - buildUpdates и exportAll вызываются из runProcessing;
   их тела — заглушки до Вех 6/7.
 
 Оркестрация (порядок):
   getAllMessages() → buildUpdates(messages, existingIds)
   → updateThreadAndParent(updates) → exportAll() → setState('stage','done')
+
 14.4. Что должно быть в Вехе 6 (processor.ts)
 - parent_id: идём по [references..., in_reply_to] с конца, берём первый externalId,
   который есть в БД. Если нет — null.
@@ -441,8 +469,20 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
 - Результат — массив updates для updateThreadAndParent.
 - Чистая функция: (messages, existingIds) → updates. Легко тестируется без БД.
 
-Статус: 🔄 стаб создан в src/processor.ts (Веха 5), тело — Веха 6.
-Контракт финальный: buildUpdates(messages, existingIds) → UpdateThreadInput[].
+Статус: ✅ реализовано в src/processor.ts, покрыто тестами в src/processor.test.ts
+(27/27 зелёных).
+
+Уточнения, зафиксированные при реализации:
+- Контракт: buildUpdates(messages: MessageRow[], existingIds: Set<string>)
+  → UpdateThreadInput[].
+- existingIds = new Set(messages.map(m => m.externalId)) — передаёт worker.
+- DSU: union(child, target) → корнем становится target. Links обходятся
+  в обратном порядке [inReplyTo, references[last], …, references[0]],
+  чтобы корнем оказался references[0].
+- Мёртвые id из links создают узлы DSU (склейка тредов между запусками).
+- Self-reference (m.externalId в links) исключается и из union, и из parentId.
+- Пустые строки/null в references/inReplyTo отфильтровываются.
+- Логгера нет — модуль чистый.
 
 14.5. Что должно быть в Вехе 7 (exporter.ts)
 - Читает getAllMessages().
@@ -450,8 +490,13 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
   externalId, parentId, threadKey, subject, fromAddr, toAddrs, sentAt.
 - Порядок строк детерминирован (по externalId или по id).
 - Ошибки записи — фатальны (exit code ≠ 0).
-Статус: 🔄 стаб создан в src/exporter.ts (Веха 5), тело — Веха 7.
+Статус: ⏳ стаб создан в src/exporter.ts (Веха 5), тело — Веха 7 (следующая).
+        Контракт финальный: exportAll() → Promise<void>.
+
 Контракт финальный: exportAll() → Promise<void>.
+Перед Запросом 1 по Вехе 7 уточнить: порядок строк (id vs externalId),
+поведение при пустом результате, формат sentAt (ISO/null), создание ./out/,
+стратегия тестирования ФС.
 
 14.6. Границы вех (что НЕ делать раньше времени)
 - В client.ts не добавлять логику БД или состояния — только HTTP.

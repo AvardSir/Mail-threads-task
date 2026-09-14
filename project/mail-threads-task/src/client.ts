@@ -41,7 +41,7 @@ const config: ClientConfig = {
 };
 
 // ---- 3. Логгер (корневой) ----
-const rootLogger = pino({
+export const rootLogger = pino({
   level: process.env.LOG_LEVEL || 'info',
   formatters: { level: (label) => ({ level: label }) },
   timestamp: pino.stdTimeFunctions.isoTime,
