@@ -100,12 +100,12 @@ export async function fetchMessages(
   logger.info('Starting fetchMessages');
 
   const operationTimeout = config.totalOperationTimeout;
+  let timeoutId: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    setTimeout(() => {
+    timeoutId = setTimeout(() => {
       reject(new Error(`Operation timed out after ${operationTimeout}ms`));
     }, operationTimeout);
   });
-
   const fetchPromise = (async () => {
     let attempt = 0;
     let lastError: Error | null = null;
@@ -212,5 +212,11 @@ export async function fetchMessages(
     throw lastError || new Error('Fetch failed after all retries');
   })();
 
-  return Promise.race([fetchPromise, timeoutPromise]);
+  try {
+    return await Promise.race([fetchPromise, timeoutPromise]);
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
 }

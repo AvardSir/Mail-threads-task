@@ -94,6 +94,7 @@ export const runWorker = async (options?: WorkerOptions): Promise<Stage> => {
 };
 
 // ---- 4. CLI entry ----
+/* istanbul ignore next */
 if (require.main === module) {
   runWorker()
     .then((stage) => {

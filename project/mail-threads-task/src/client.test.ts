@@ -42,7 +42,9 @@ function createValidResponse(items: Partial<MessageItem>[] = [], nextCursor: str
     })),
     next_cursor: nextCursor,
   };
-}
+};
+
+const TOTAL_OP_TIMEOUT_MS = Number(process.env.TOTAL_OPERATION_TIMEOUT);
 
 describe('fetchMessages', () => {
   beforeEach(() => {
@@ -52,6 +54,11 @@ describe('fetchMessages', () => {
   });
 
   afterAll(() => {
+    // Abort any nock request still pending (e.g. T1.4's .delay(500) response
+    // that outlives the test's 100ms operation timeout). Without this,
+    // --runInBand leaks the stale request into worker.test.ts.
+    nock.abortPendingRequests();
+    nock.cleanAll();
     nock.enableNetConnect();
   });
 
@@ -310,33 +317,37 @@ describe('fetchMessages', () => {
   // --- 6. Общий таймаут операции ---
   describe('operation timeout', () => {
     it('should throw if total operation time exceeds TOTAL_OPERATION_TIMEOUT', async () => {
+      const originalTimeout = process.env.TOTAL_OPERATION_TIMEOUT;
       jest.resetModules();
       process.env.TOTAL_OPERATION_TIMEOUT = '100';
 
-      jest.doMock('axios', () => {
-        const actual = jest.requireActual('axios');
-        return {
-          ...actual,
-          default: {
-            ...actual.default,
+      try {
+        jest.doMock('axios', () => {
+          const actual = jest.requireActual('axios');
+          return {
+            ...actual,
+            default: {
+              ...actual.default,
+              create: () => ({
+                get: () => new Promise(() => { /* висит вечно */ }),
+              }),
+              isAxiosError: actual.default.isAxiosError,
+            },
             create: () => ({
-              get: () => new Promise(() => { /* висит вечно */ }),
+              get: () => new Promise(() => { }),
             }),
             isAxiosError: actual.default.isAxiosError,
-          },
-          create: () => ({
-            get: () => new Promise(() => { }),
-          }),
-          isAxiosError: actual.default.isAxiosError,
-        };
-      });
+          };
+        });
 
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { fetchMessages: fetch2 } = require('./client');
-      await expect(fetch2()).rejects.toThrow(/Operation timed out/);
-
-      jest.dontMock('axios');
-      jest.resetModules();
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { fetchMessages: fetch2 } = require('./client');
+        await expect(fetch2()).rejects.toThrow(/Operation timed out/);
+      } finally {
+        process.env.TOTAL_OPERATION_TIMEOUT = originalTimeout;
+        jest.dontMock('axios');
+        jest.resetModules();
+      }
     });
 
   });
@@ -356,4 +367,160 @@ describe('fetchMessages', () => {
     });
 
   });
+
+
+
+  // ============================================================
+  // T1 — timeout cleanup (мини-веха T1: §11.7 / §14.1 techdebt)
+  // ============================================================
+  describe('T1 — timeout cleanup', () => {
+    const origSetTimeout = global.setTimeout;
+    const origClearTimeout = global.clearTimeout;
+
+    let capturing: boolean;
+    let timerCalls: Array<{ ms: number | undefined; id: unknown }>;
+    let clearedIds: unknown[];
+
+    beforeEach(() => {
+      capturing = false;
+      timerCalls = [];
+      clearedIds = [];
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (global as any).setTimeout = function (
+        fn: (...args: any[]) => void,
+        ms?: number,
+        ...args: any[]
+      ) {
+        const id = origSetTimeout(fn as any, ms as any, ...args);
+        if (capturing) timerCalls.push({ ms, id });
+        return id;
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (global as any).clearTimeout = function (id?: unknown) {
+        if (capturing) clearedIds.push(id);
+        return origClearTimeout(id as any);
+      };
+    });
+
+    afterEach(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (global as any).setTimeout = origSetTimeout;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (global as any).clearTimeout = origClearTimeout;
+    });
+
+    const opIdsWithMs = (ms: number): unknown[] =>
+      timerCalls.filter((c) => c.ms === ms).map((c) => c.id);
+
+    it('T1.1 clears the total-operation timeout after a successful response', async () => {
+      nock(baseUrl)
+        .get('/v1/messages')
+        .query({ limit: '200' })
+        .reply(200, createValidResponse([], null));
+
+      capturing = true;
+      try {
+        await fetchMessages();
+      } finally {
+        capturing = false;
+      }
+
+      const opIds = opIdsWithMs(TOTAL_OP_TIMEOUT_MS);
+      expect(opIds.length).toBe(1);
+      expect(clearedIds.includes(opIds[0])).toBe(true);
+    });
+
+    it('T1.2 clears the timeout after a non-retryable 400', async () => {
+      nock(baseUrl)
+        .get('/v1/messages')
+        .query({ limit: '200' })
+        .reply(400, { error: 'bad request' });
+
+      capturing = true;
+      try {
+        await expect(fetchMessages()).rejects.toThrow();
+      } finally {
+        capturing = false;
+      }
+
+      const opIds = opIdsWithMs(TOTAL_OP_TIMEOUT_MS);
+      expect(opIds.length).toBe(1);
+      expect(clearedIds.includes(opIds[0])).toBe(true);
+    });
+
+    it('T1.3 clears the timeout after retries are exhausted', async () => {
+      const maxRetries = Number(process.env.MAX_RETRIES);
+      nock(baseUrl)
+        .get('/v1/messages')
+        .query({ limit: '200' })
+        .times(maxRetries + 1)
+        .reply(500);
+
+      capturing = true;
+      try {
+        await expect(fetchMessages()).rejects.toThrow();
+      } finally {
+        capturing = false;
+      }
+
+      const opIds = opIdsWithMs(TOTAL_OP_TIMEOUT_MS);
+      expect(opIds.length).toBe(1);
+      expect(clearedIds.includes(opIds[0])).toBe(true);
+    });
+
+    it('T1.4 clears the timeout id when the total-operation timeout fires', async () => {
+      const originalTimeout = process.env.TOTAL_OPERATION_TIMEOUT;
+      const localMs = 100;
+
+      jest.resetModules();
+      process.env.TOTAL_OPERATION_TIMEOUT = String(localMs);
+
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { fetchMessages: fetchMessagesFast } = require('./client');
+
+        nock(baseUrl)
+          .get('/v1/messages')
+          .query({ limit: '200' })
+          .delay(500)
+          .reply(200, createValidResponse([], null));
+
+        capturing = true;
+        try {
+          await expect(fetchMessagesFast()).rejects.toThrow();
+        } finally {
+          capturing = false;
+        }
+
+        const opIds = opIdsWithMs(localMs);
+        expect(opIds.length).toBe(1);
+        expect(clearedIds.includes(opIds[0])).toBe(true);
+      } finally {
+        process.env.TOTAL_OPERATION_TIMEOUT = originalTimeout;
+        jest.resetModules();
+      }
+    });
+
+    it('T1.5 uses exactly one total-operation timer per call and clears it', async () => {
+      nock(baseUrl)
+        .get('/v1/messages')
+        .query({ limit: '200' })
+        .reply(200, createValidResponse([], null));
+
+      capturing = true;
+      try {
+        await fetchMessages();
+      } finally {
+        capturing = false;
+      }
+
+      const opIds = opIdsWithMs(TOTAL_OP_TIMEOUT_MS);
+      expect(opIds.length).toBe(1);
+      const clearsForOp = clearedIds.filter((id) => id === opIds[0]).length;
+      expect(clearsForOp).toBe(1);
+    });
+  });
+
 });

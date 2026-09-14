@@ -31,7 +31,8 @@ project/
     ├── worker.test.ts      ← ✅
     ├── processor.ts        ← постобработка (Веха 6) ✅
     ├── processor.test.ts   ← ✅ 27 тестов
-    └── exporter.ts         ← экспорт JSONL (стаб Веха 5, тело — Веха 7) ⏳
+    ├── exporter.ts         ← экспорт JSONL (Веха 7) ✅
+    └── exporter.test.ts    ← ✅ 18 тестов
 
 4. ⚙️ Конфиг: правила игры
 4.1 Env-переменные читаются один раз при импорте модуля
@@ -336,25 +337,30 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
 
 Только Запрос 3 может содержать реализацию фичи.
 Нарушение последовательности = нарушение §13.0.
+
+Практика подтвердила §13.5: exporter.ts на Вехе 7 прошёл стаб(b) → throw
+('Not implemented') → Red (18/18) → Green (18/18) без единой правки тестов
+на фазе реализации. Ни одного ложного зелёного.
+
 ---
 
 14. 🗺 Дорожная карта (вехи)
 
 Статусы: ✅ выполнено · 🔄 в работе · ⏳ запланировано
 
-| #   | Веха                            | Артефакты                                                         | Статус      |
-| --- | ------------------------------- | ----------------------------------------------------------------- | ----------- |
-| 0   | Подготовка окружения            | VPN, клон репо, .env, доступ к provider                           | ✅           |
-| 1   | Инициализация TS-проекта        | package.json, tsconfig, структура src/, скрипты                   | ✅           |
-| 2   | Модель БД и миграции            | prisma/schema.prisma, миграция init, docker-compose.dev.yml       | ✅           |
-| 3   | HTTP-клиент с обработкой ошибок | src/client.ts, src/client.test.ts, jest.config.js, jest.setup.ts  | ✅           |
-| 4   | Слой БД                         | src/db.ts, src/db.test.ts, src/prisma.ts                          | ✅           |
-| 5   | Основной цикл (worker)          | src/worker.ts, src/worker.test.ts, стабы processor.ts/exporter.ts | ✅           |
-| 6   | Постобработка                   | src/processor.ts, src/processor.test.ts (parent_id, thread_key)   | ✅           |
-| 7   | Экспорт                         | src/exporter.ts → ./out/result.jsonl                              | 🔄 следующая |
-| 8   | Production Docker               | Dockerfile, docker-compose.yml (db + worker + exporter)           | ⏳           |
-| 9   | E2E-прогон                      | Полный цикл: load → process → export                              | ⏳           |
-| 10  | Документация                    | README, инструкция запуска, переменные окружения                  | ⏳           |
+| #   | Веха                            | Артефакты                                                         | Статус |
+| --- | ------------------------------- | ----------------------------------------------------------------- | ------ |
+| 0   | Подготовка окружения            | VPN, клон репо, .env, доступ к provider                           | ✅      |
+| 1   | Инициализация TS-проекта        | package.json, tsconfig, структура src/, скрипты                   | ✅      |
+| 2   | Модель БД и миграции            | prisma/schema.prisma, миграция init, docker-compose.dev.yml       | ✅      |
+| 3   | HTTP-клиент с обработкой ошибок | src/client.ts, src/client.test.ts, jest.config.js, jest.setup.ts  | ✅      |
+| 4   | Слой БД                         | src/db.ts, src/db.test.ts, src/prisma.ts                          | ✅      |
+| 5   | Основной цикл (worker)          | src/worker.ts, src/worker.test.ts, стабы processor.ts/exporter.ts | ✅      |
+| 6   | Постобработка                   | src/processor.ts, src/processor.test.ts (parent_id, thread_key)   | ✅      |
+| 7   | Экспорт                         | src/exporter.ts → ./out/result.jsonl, src/exporter.test.ts        | ✅      |
+| 8   | Production Docker               | Dockerfile, docker-compose.yml (db + worker + exporter)           | ⏳      |
+| 9   | E2E-прогон                      | Полный цикл: load → process → export                              | ⏳      |
+| 10  | Документация                    | README, инструкция запуска, переменные окружения                  | ⏳      |
 
 14.1. Текущий статус
 
@@ -377,26 +383,65 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
 - Все ограничения и грабли Вехи 3 зафиксированы в §4–§11 — источник истины
   для клиента, менять их без причины нельзя.
 
-Открытый техдолг (не блокирует вехи, но помнить):
-- client.ts: timeoutPromise внутри fetchMessages не очищает setTimeout
-  при быстром ответе → Jest выводит "did not exit one second after test run".
-  Это §11.7 (Promise.race не убивает проигравший промис). Сейчас — приемлемо
-  для тестов, но перед Вехой 8 (production Docker) стоит починить:
-  хранить timeoutId и делать clearTimeout в finally fetchPromise.
-  Правка затронет замороженный client.ts — требует отдельного решения
-  и полного перепрогона client.test.ts.
+- Веха 7 завершена: src/exporter.ts реализован (18/18 тестов зелёных в
+  src/exporter.test.ts), стаб заменён на рабочее тело.
+  Полный прогон — 5 сьютов, 95/95 зелёных
+  (client + db + worker + processor + exporter).
+  Контракт: exportAll(outputPath?: string) → Promise<void>, дефолт
+  './out/result.jsonl'; exportAll — чистая библиотечная функция, process.exit
+  только в runCli под require.main === module.
+  Порядок строк = порядок getAllMessages() (id ASC). Пустой результат →
+  файл 0 байт. sentAt: Date → toISOString(), null → null.
+  mkdir(dirname(outputPath), { recursive: true }) перед записью.
+  Экспортируется тип ExportedMessage (7 полей). Логгер —
+  rootLogger.child({ module: 'exporter' }), info на старте/финише, error
+  при падении.
+  Побочная правка: в src/client.ts rootLogger получил export
+  (const → export const), чтобы exporter мог его импортировать.
+  Поведение client.ts не изменилось, client.test.ts зелёный.
+  Coverage по exporter.ts: 96.42% stmts / 85.71% branch / 100% funcs /
+  95.83% lines. Единственная непокрытая ветка — CLI-entrypoint
+  (require.main === module), не покрывается unit-тестами по природе;
+  кандидат на /* istanbul ignore next */ или E2E-покрытие в Вехе 9.
+  Решение по этому пункту отложено.
 
+- Следующий шаг — Веха 8 (production Docker: Dockerfile,
+  docker-compose.yml с db + worker + exporter). Перед ней — решить судьбу
+  техдолга из §14.1 (см. ниже): чинить ли timeoutPromise/clearTimeout
+  в client.ts отдельной мини-вехой TDD (План → Red → Green), или
+  отложить до Вехи 9/E2E.
+
+
+Открытый техдолг (не блокирует вехи, но помнить):
+- ✅ client.ts: timeoutPromise очищается через clearTimeout в finally
+  вокруг Promise.race (мини-веха T1, отдельный коммит).
+  Симптом "did not exit one second after test run" закрыт.
+  Побочно: §6 operation timeout в client.test.ts восстановлен
+  через try/finally (process.env.TOTAL_OPERATION_TIMEOUT), а
+  afterAll файла получил nock.abortPendingRequests() +
+  nock.cleanAll() перед enableNetConnect() — иначе --runInBand
+  ловил NetConnectNotAllowedError от висячего nock-ответа T1.4.
+
+- Следующий шаг — Веха 8 (production Docker: Dockerfile,
+  docker-compose.yml с db + worker + exporter).
 - Параллельный запуск runWorker в двух процессах не защищён
   (нет распределённой блокировки по stage). Отметить в README (Веха 10).
 
 - Локально рекомендуется `npm test -- --runInBand`, пока db.test.ts
   и worker.test.ts делят одну БД — иначе гонка на TRUNCATE.
 
-- Следующий шаг — Веха 7 (src/exporter.ts). Работаем по TDD (§13):
-  Запрос 1 — план, Запрос 2 — тесты (Red), Запрос 3 — реализация (Green).
-  Перед Запросом 1 уточнить у пользователя: порядок строк (id vs externalId),
-  поведение при пустом результате, формат sentAt, создание ./out/, стратегия
-  тестирования ФС (tmpdir + аргумент outputPath vs мок fs).
+- exporter.ts: ветка require.main === module не покрыта unit-тестами
+  (CLI-entrypoint). Не блокирует, но перед Вехой 9 (E2E) стоит либо
+  пометить /* istanbul ignore next */, либо покрыть E2E. Аналогичная
+  ситуация, вероятно, в worker.ts — проверить при касании.
+
+- Правка client.ts (export const rootLogger) — минимальна и не нарушает
+  «заморозку»: тело client.ts, поведение fetchMessages, axios-конфиг,
+  retry-логика — не тронуты. Если перед Вехой 8 будет чиниться
+  timeoutPromise (§11.7), правка rootLogger уже в дереве и должна быть
+  учтена при полном перепрогоне client.test.ts.
+
+
 
 14.2. Что должно быть в Вехе 4 (db.ts)
 Публичный контракт (обязателен, из §3.1 исходного ТЗ):
@@ -490,13 +535,25 @@ MessageRow (источник истины для processor):
   externalId, parentId, threadKey, subject, fromAddr, toAddrs, sentAt.
 - Порядок строк детерминирован (по externalId или по id).
 - Ошибки записи — фатальны (exit code ≠ 0).
-Статус: ⏳ стаб создан в src/exporter.ts (Веха 5), тело — Веха 7 (следующая).
-        Контракт финальный: exportAll() → Promise<void>.
+Статус: ✅ реализовано в src/exporter.ts, покрыто тестами в src/exporter.test.ts
+(18/18 зелёных).
+Контракт финальный: exportAll(outputPath?: string) → Promise<void>.
+Дополнительно экспортируются: ExportedMessage (7 полей), runCli.
 
-Контракт финальный: exportAll() → Promise<void>.
-Перед Запросом 1 по Вехе 7 уточнить: порядок строк (id vs externalId),
-поведение при пустом результате, формат sentAt (ISO/null), создание ./out/,
-стратегия тестирования ФС.
+Уточнения, зафиксированные при реализации:
+- Порядок строк — как отдал getAllMessages() (id ASC). Сортировка —
+  ответственность db-слоя, не exporter.
+- Пустой результат → файл создаётся, 0 байт.
+- sentAt: Date → Date.toISOString(), null → null. Тип ExportedMessage.sentAt
+  = string | null.
+- mkdir(dirname(outputPath), { recursive: true }) перед writeFile.
+- Файл терминирован \n (включая последнюю строку).
+- Поля JSON — фиксированный порядок: externalId, parentId, threadKey,
+  subject, fromAddr, toAddrs, sentAt.
+- id (internal PK) в JSONL не попадает.
+- Тесты: реальная ФС в os.tmpdir() + уникальная подпапка на тест,
+  getAllMessages мокается, fs/promises частично мокается для D1/D2.
+  pino мокается стандартным моком §9.3.
 
 14.6. Границы вех (что НЕ делать раньше времени)
 - В client.ts не добавлять логику БД или состояния — только HTTP.
