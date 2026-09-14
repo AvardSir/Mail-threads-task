@@ -23,7 +23,11 @@ project/
 ├── jest.setup.ts           ← env-переменные для тестов (в git)
 └── src/
     ├── client.ts           ← вся логика клиента
-    └── client.test.ts      ← тесты
+    ├── client.test.ts      ← тесты
+    ├── prisma.ts           ← shared PrismaClient (один на процесс)
+    ├── db.ts               ← слой БД (Веха 4)
+    └── db.test.ts          ← тесты слоя БД
+    
 4. ⚙️ Конфиг: правила игры
 4.1 Env-переменные читаются один раз при импорте модуля
 ts
@@ -189,6 +193,9 @@ max retries exhausted	.times(maxRetries + 1) × 500
 8	pino.stdTimeFunctions в моке	без него падение на этапе импорта
 9	.times(N) в nock без учёта maxRetries	N = maxRetries + 1
 10	Env в боевом .env ≠ env для тестов	для тестов — jest.setup.ts
+11	@@map в Prisma	в raw SQL и TRUNCATE — имена таблиц ("messages", "app_state"), не моделей
+
+
 12. 🎓 TL;DR
 Клиент — это один модуль с одной функцией.
 Конфиг — читается один раз, меняется только через reset modules.
@@ -200,12 +207,17 @@ Retry — только для транзиентных ошибок, всё ос
 
 13. 🧪 TDD-практика
 
+Сначала реализовываем тесты. Затем отедльным тестом реализовываем основую фичу.
+
 13.1. Цикл
 - Red: сначала пишем падающий тест на новое поведение.
 - Green: минимальная реализация, чтобы тест прошёл.
 - Refactor: улучшаем код, тесты остаются зелёными.
 
 13.2. Правила
+- Окружение: Docker Desktop запущен локально, контейнеры (PostgreSQL) поднимаются
+  автоматически при старте Docker Desktop. Команду `docker compose up` в плане
+  не использовать — считаем, что БД уже доступна по DATABASE_URL.
 - Тест — это спецификация. Не подгоняем тест под багованный код;
   если код ведёт себя не так — сначала правим ожидание или код, но осознанно.
 - HTTP-взаимодействие тестируем через nock; реальные запросы к провайдеру запрещены.
@@ -237,8 +249,8 @@ Retry — только для транзиентных ошибок, всё ос
 | 1 | Инициализация TS-проекта | package.json, tsconfig, структура src/, скрипты | ✅ |
 | 2 | Модель БД и миграции | prisma/schema.prisma, миграция init, docker-compose.dev.yml | ✅ |
 | 3 | HTTP-клиент с обработкой ошибок | src/client.ts, src/client.test.ts, jest.config.js, jest.setup.ts | ✅ |
-| 4 | Слой БД | src/db.ts, src/db.test.ts | 🔄 следующая |
-| 5 | Основной цикл (worker) | src/worker.ts, обработка stage/cursor | ⏳ |
+| 4 | Слой БД | src/db.ts, src/db.test.ts, src/prisma.ts | ✅ |
+| 5 | Основной цикл (worker) | src/worker.ts, обработка stage/cursor | 🔄 следующая |
 | 6 | Постобработка | src/processor.ts (parent_id, thread_key через DSU) | ⏳ |
 | 7 | Экспорт | src/exporter.ts → ./out/result.jsonl | ⏳ |
 | 8 | Production Docker | Dockerfile, docker-compose.yml (db + worker + exporter) | ⏳ |
@@ -247,25 +259,33 @@ Retry — только для транзиентных ошибок, всё ос
 
 14.1. Текущий статус
 - Веха 3 завершена: client.ts реализован, тесты зелёные.
+- Веха 4 завершена: src/prisma.ts, src/db.ts, src/db.test.ts реализованы,
+  все тесты зелёные.
 - Все ограничения и грабли Вехи 3 зафиксированы в §4–§11 — это источник истины
   для клиента, менять их без причины нельзя.
-- Следующий шаг — Веха 4 (src/db.ts). Работаем по TDD (§13): тесты → реализация.
-
+- Следующий шаг — Веха 5 (src/worker.ts). Работаем по TDD (§13): тесты → реализация.
 14.2. Что должно быть в Вехе 4 (db.ts)
 Публичный контракт (обязателен, из §3.1 исходного ТЗ):
+
 - getState(key): Promise<string | null>
 - setState(key, value): Promise<void>
 - saveMessages(messages: MessageItem[]): Promise<number>  // возвращает кол-во вставленных
 - getAllMessages(): Promise<MessageRow[]>
 - updateThreadAndParent(updates: Array<{ externalId, parentId, threadKey }>): Promise<void>
 
+Статус: ✅ реализовано в src/db.ts, покрыто тестами в src/db.test.ts.
+Дополнительно экспортируются типы: MessageItem, MessageRow, UpdateThreadInput.
+
+
 Правила:
 - saveMessages — идемпотентна: дубликаты по externalId пропускаем (skipDuplicates).
 - updateThreadAndParent — батчевое обновление, без N+1.
 - Все функции — на Prisma-клиенте из shared-инстанса (один PrismaClient на процесс).
-- Тесты — против реального PostgreSQL из docker-compose.dev.yml, с TRUNCATE
-  в beforeEach (§13.2). Мокать Prisma нельзя — иначе теряется смысл слоя.
-- Никакой бизнес-логики в db.ts: только доступ к данным.
+- Тесты — против реального PostgreSQL (Docker Desktop уже запущен, см. §13.2),
+  с TRUNCATE в beforeEach. Мокать Prisma нельзя — иначе теряется смысл слоя.
+- Таблицы в БД называются по @@map: "messages" и "app_state". В raw SQL и в
+  TRUNCATE использовать именно эти имена, а не имена моделей Prisma
+  (Message/AppState) — иначе relation does not exist.- Никакой бизнес-логики в db.ts: только доступ к данным.
 
 14.3. Что должно быть в Вехе 5 (worker.ts)
 - Читает stage через getState('stage').
@@ -275,6 +295,8 @@ Retry — только для транзиентных ошибок, всё ос
 - При рестарте: если stage === 'processing' — сразу к постобработке (не перезагружать).
 - Если stage === 'done' — выход.
 - Все переходы stage — через setState, атомарно относительно падений.
+Порядок: зафиксировать контракт worker.ts → тесты (nock + реальная БД) →
+реализация. Переходы stage — источник истины, не менять на ходу.
 
 14.4. Что должно быть в Вехе 6 (processor.ts)
 - parent_id: идём по [references..., in_reply_to] с конца, берём первый externalId,

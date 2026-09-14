@@ -10,20 +10,21 @@ datasource db {
 }
 
 model Message {
-  id          Int      @id @default(autoincrement())
-  externalId  String   @unique
+  id          Int       @id @default(autoincrement())
+  externalId  String    @unique
   inReplyTo   String?
   references  String[]
-  subject     String
-  fromAddr    String
+  subject     String?
+  fromAddr    String?
   toAddrs     String[]
-  sentAt      DateTime
+  sentAt      DateTime?
   parentId    String?
   threadKey   String?
-  createdAt   DateTime @default(now())
+  createdAt   DateTime  @default(now())
 
   @@map("messages")
 }
+
 
 model AppState {
   key   String @id

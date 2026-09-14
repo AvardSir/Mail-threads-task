@@ -1,0 +1,4 @@
+-- AlterTable
+ALTER TABLE "messages" ALTER COLUMN "subject" DROP NOT NULL,
+ALTER COLUMN "fromAddr" DROP NOT NULL,
+ALTER COLUMN "sentAt" DROP NOT NULL;
