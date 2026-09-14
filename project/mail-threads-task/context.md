@@ -126,8 +126,11 @@ describe('fetchMessages', () => {
   });
 
   afterAll(() => {
-    nock.enableNetConnect();
-  });
+  nock.abortPendingRequests();  // ← гасит висячие .delay()-ответы,
+                                //   иначе --runInBand ловит NetConnectNotAllowedError
+  nock.cleanAll();
+  nock.enableNetConnect();
+});
 });
 9.2 Никогда не использовать
 ❌ jest.useFakeTimers() + jest.advanceTimersByTime() — конфликтуют с axios/nock.
@@ -135,6 +138,15 @@ describe('fetchMessages', () => {
 ❌ process.env.X = ... внутри теста — не работает после импорта.
 
 ❌ Ожидание, что клиент ретраит валидационную ошибку.
+
+❌ Оставлять process.env.X переопределённым после теста — в --runInBand
+   утечёт в следующий тест-файл (и в client.ts, который закешировал
+   config при импорте). Всегда оборачивать в try/finally:
+
+   const orig = process.env.X;
+   process.env.X = '...';
+   try { ... } finally { process.env.X = orig; jest.resetModules(); }
+
 
 9.3 Мок pino — обязательный
 ts
@@ -199,7 +211,7 @@ jest.resetModules();
 4	Retry на 3xx/4xx	retry только 429 / 5xx / network-коды
 5	axios следует редиректам	maxRedirects: 0
 6	nock без cleanAll() в beforeEach	иначе интерсепторы утекают между тестами
-7	Promise.race не убивает проигравший промис	учитывай висящие sleep-ы после таймаута
+7 | Promise.race не убивает проигравший промис | (a) timeoutId хранить и чистить clearTimeout в finally вокруг Promise.race — иначе Jest «did not exit one second after test run»; (b) висячий nock.delay()-ответ переживает тест и убивает следующий файл в --runInBand — nock.abortPendingRequests() в afterAll
 8	pino.stdTimeFunctions в моке	без него падение на этапе импорта
 9	.times(N) в nock без учёта maxRetries	N = maxRetries + 1
 10	Env в боевом .env ≠ env для тестов	для тестов — jest.setup.ts
@@ -208,6 +220,8 @@ jest.resetModules();
 | 13 | MessageRow.references: string[] — НЕ nullable, inReplyTo: string \| null | в processor.ts фильтр пустых/null всё равно нужен для inReplyTo; не писать `m.references ?? []` |
 | 14 | DSU: корень = target в union(child, target) | обходить links в обратном порядке `[inReplyTo, references[last], …, references[0]]` — тогда корнем становится `references[0]`; мёртвые id из links тоже становятся узлами DSU |
 | 15 | processor.ts — чистая функция без БД, HTTP, логгера | `buildUpdates(messages, existingIds) → UpdateThreadInput[]`; self-reference (`m.externalId`) исключается и из parentId, и из union |
+| 16 | Env, переопределённый в тесте через process.env.X = ..., не восстанавливается | оборачивать в try/finally с restore; иначе в --runInBand утекает в следующий файл (client.ts кеширует config при импорте) |
+| 17 | nock .delay(ms) с ms > operation timeout | тест падает по таймауту раньше, чем nock отдаёт ответ → висячий Immediate.cb → NetConnectNotAllowedError в следующем файле; лечится nock.abortPendingRequests() в afterAll |
 
 12. 🎓 TL;DR
 Клиент — это один модуль с одной функцией.
@@ -406,11 +420,7 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
   Решение по этому пункту отложено.
 
 - Следующий шаг — Веха 8 (production Docker: Dockerfile,
-  docker-compose.yml с db + worker + exporter). Перед ней — решить судьбу
-  техдолга из §14.1 (см. ниже): чинить ли timeoutPromise/clearTimeout
-  в client.ts отдельной мини-вехой TDD (План → Red → Green), или
-  отложить до Вехи 9/E2E.
-
+  docker-compose.yml с db + worker + exporter).
 
 Открытый техдолг (не блокирует вехи, но помнить):
 - ✅ client.ts: timeoutPromise очищается через clearTimeout в finally
@@ -432,16 +442,9 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
 
 - exporter.ts: ветка require.main === module не покрыта unit-тестами
   (CLI-entrypoint). Не блокирует, но перед Вехой 9 (E2E) стоит либо
-  пометить /* istanbul ignore next */, либо покрыть E2E. Аналогичная
-  ситуация, вероятно, в worker.ts — проверить при касании.
-
-- Правка client.ts (export const rootLogger) — минимальна и не нарушает
-  «заморозку»: тело client.ts, поведение fetchMessages, axios-конфиг,
-  retry-логика — не тронуты. Если перед Вехой 8 будет чиниться
-  timeoutPromise (§11.7), правка rootLogger уже в дереве и должна быть
-  учтена при полном перепрогоне client.test.ts.
-
-
+  пометить /* istanbul ignore next */, либо покрыть E2E.
+  В worker.ts аналогичная ветка уже помечена /* istanbul ignore next */
+  в мини-вехе T1.
 
 14.2. Что должно быть в Вехе 4 (db.ts)
 Публичный контракт (обязателен, из §3.1 исходного ТЗ):
