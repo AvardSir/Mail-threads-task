@@ -62,9 +62,11 @@ const dbItem = (externalId: string) => ({
 
 describe('runWorker', () => {
   beforeEach(async () => {
-    nock.cleanAll();
-    nock.disableNetConnect();
-    jest.clearAllMocks();
+    nock.abortPendingRequests();   // ← первая строка: убить чужие висячие сокеты
+  nock.cleanAll();
+  nock.disableNetConnect();       // ← только после того, как всё подчищено
+  jest.clearAllMocks();
+
 
     (processor.buildUpdates as jest.Mock).mockReset().mockReturnValue([]);
     (exporter.exportAll as jest.Mock).mockReset().mockResolvedValue(undefined);
@@ -74,9 +76,19 @@ describe('runWorker', () => {
     );
   });
 
-  afterAll(() => {
-    nock.enableNetConnect();
+  afterEach(() => {
+    nock.abortPendingRequests();   // ← гасим висячие .delay()-ответы сразу
   });
+
+
+  afterAll(() => {
+    nock.abortPendingRequests();
+    nock.cleanAll();
+    nock.enableNetConnect();
+
+});
+
+
 
   // ---- A. Happy path ----
   describe('happy path', () => {

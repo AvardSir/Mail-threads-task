@@ -1,10 +1,8 @@
 # Почтовый сервис для тестового задания.
-# Свои службы дописывайте в этот же файл.
 # Обязательные имена служб: worker и exporter.
 
 services:
   provider:
-    # Образ скачивается сам при первом запуске, собирать его не нужно.
     image: ${PROVIDER_IMAGE:-gitea.teamlead.one/armanteam_public/mail-provider:1}
     environment:
       CANDIDATE: ${CANDIDATE:?укажите CANDIDATE в файле .env}
@@ -21,12 +19,63 @@ services:
       retries: 10
       start_period: 15s
 
-  # Пример подключения своей службы:
-  #
-  # worker:
-  #   build: .
-  #   depends_on:
-  #     provider:
-  #       condition: service_healthy
-  #   environment:
-  #     PROVIDER_URL: http://provider:8080
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mailthreads
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mailthreads"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: mail-threads-app:latest
+    command: ["node", "dist/worker.js"]
+    depends_on:
+      db:
+        condition: service_healthy
+      provider:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      PROVIDER_URL: http://provider:8080
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/mailthreads?schema=public
+      REQUEST_TIMEOUT: "10000"
+      MAX_RETRIES: "5"
+      BASE_DELAY: "500"
+      MAX_DELAY: "30000"
+      TOTAL_OPERATION_TIMEOUT: "600000"
+      LOG_LEVEL: "info"
+    restart: "no"
+
+  exporter:
+    build: .
+    image: mail-threads-app:latest
+    command: ["node", "dist/exporter.js"]
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      PROVIDER_URL: http://provider:8080
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/mailthreads?schema=public
+      REQUEST_TIMEOUT: "10000"
+      MAX_RETRIES: "5"
+      BASE_DELAY: "500"
+      MAX_DELAY: "30000"
+      TOTAL_OPERATION_TIMEOUT: "600000"
+      LOG_LEVEL: "info"
+    volumes:
+      - ./out:/app/out
+    restart: "no"
+
+volumes:
+  postgres_data:

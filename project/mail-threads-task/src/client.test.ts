@@ -54,19 +54,11 @@ describe('fetchMessages', () => {
   });
 
   afterAll(() => {
-    // Abort any nock request still pending (e.g. T1.4's .delay(500) response
-    // that outlives the test's 100ms operation timeout). Without this,
-    // --runInBand leaks the stale request into worker.test.ts.
-    nock.abortPendingRequests();
-    nock.cleanAll();
-    nock.enableNetConnect();
-  });
+  nock.cleanAll();
+  nock.enableNetConnect();
+});
 
 
-
-  // afterEach(() => {
-  //   jest.useRealTimers();
-  // });
 
   const baseUrl = 'http://test-provider';
 
@@ -405,11 +397,9 @@ describe('fetchMessages', () => {
     });
 
     afterEach(() => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (global as any).setTimeout = origSetTimeout;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (global as any).clearTimeout = origClearTimeout;
-    });
+  nock.abortPendingRequests();   // ← гасим хвосты сразу после каждого теста
+});
+
 
     const opIdsWithMs = (ms: number): unknown[] =>
       timerCalls.filter((c) => c.ms === ms).map((c) => c.id);

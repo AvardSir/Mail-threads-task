@@ -52,8 +52,22 @@ function generateRequestId(): string {
   return `req-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('Operation aborted'));
+      return;
+    }
+    const id = setTimeout(() => resolve(), ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(id);
+        reject(new Error('Operation aborted'));
+      },
+      { once: true },
+    );
+  });
 }
 
 function getDelay(attempt: number, baseDelay: number, maxDelay: number): number {
@@ -100,18 +114,26 @@ export async function fetchMessages(
   logger.info('Starting fetchMessages');
 
   const operationTimeout = config.totalOperationTimeout;
+  const controller = new AbortController();
   let timeoutId: NodeJS.Timeout | undefined;
+
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(() => {
+      controller.abort();
       reject(new Error(`Operation timed out after ${operationTimeout}ms`));
     }, operationTimeout);
   });
+
   const fetchPromise = (async () => {
     let attempt = 0;
     let lastError: Error | null = null;
 
     while (attempt <= config.maxRetries) {
       try {
+        if (controller.signal.aborted) {
+          throw new Error(`Operation timed out after ${operationTimeout}ms`);
+        }
+
         logger.debug({ attempt }, `Attempt ${attempt + 1}/${config.maxRetries + 1}`);
 
         const params: Record<string, string | number> = { limit };
@@ -119,7 +141,10 @@ export async function fetchMessages(
           params.cursor = cursor;
         }
 
-        const response = await axiosInstance.get('/v1/messages', { params });
+        const response = await axiosInstance.get('/v1/messages', {
+          params,
+          signal: controller.signal,
+        });
 
         if (response.status !== 200) {
           throw new Error(`Unexpected status ${response.status}`);
@@ -142,7 +167,17 @@ export async function fetchMessages(
         logger.info({ itemsCount: items.length, nextCursor }, 'Fetch succeeded');
         return { items, next_cursor: nextCursor };
       } catch (error) {
-        // 1) Ошибки валидации (мы их бросаем сами) — сразу наружу, без retry
+        // 0) Аборт по operation timeout — приоритетнее любой классификации
+        if (controller.signal.aborted) {
+          throw new Error(`Operation timed out after ${operationTimeout}ms`);
+        }
+
+        // 0b) ERR_CANCELED от axios — не retryable (не входит в §6)
+        if (axios.isAxiosError(error) && error.code === 'ERR_CANCELED') {
+          throw error;
+        }
+
+        // 1) Валидационные ошибки (не AxiosError) — сразу наружу
         if (!axios.isAxiosError(error)) {
           logger.error({ error: (error as Error).message }, 'Non-retryable error');
           throw error;
@@ -152,7 +187,6 @@ export async function fetchMessages(
         const status = axiosError.response?.status;
         const headers = axiosError.response?.headers;
 
-        // 2) Классифицируем ошибку
         const isRateLimit = status === 429;
         const isServerError = status !== undefined && status >= 500 && status < 600;
         const isNetworkError =
@@ -163,7 +197,6 @@ export async function fetchMessages(
 
         const isRetryable = isRateLimit || isServerError || isNetworkError;
 
-        // 3) Всё остальное (3xx, 4xx кроме 429, прочее) — не ретраить
         if (!isRetryable) {
           logger.error(
             { status, code: axiosError.code, error: axiosError.message },
@@ -174,13 +207,11 @@ export async function fetchMessages(
 
         lastError = error as Error;
 
-        // 4) Если попытки кончились — бросаем последнюю ошибку
         if (attempt >= config.maxRetries) {
           logger.error({ attempt, error: lastError.message }, 'Max retries exceeded, throwing');
           throw lastError;
         }
 
-        // 5) Считаем задержку и спим
         let delayMs: number;
         if (isRateLimit) {
           const retryAfterHeader = headers?.['retry-after'] || headers?.['Retry-After'];
@@ -201,12 +232,10 @@ export async function fetchMessages(
         }
 
         if (delayMs > 0) {
-          await sleep(delayMs);
+          await sleep(delayMs, controller.signal);
         }
         attempt++;
       }
-
-
     }
 
     throw lastError || new Error('Fetch failed after all retries');
@@ -218,5 +247,8 @@ export async function fetchMessages(
     if (timeoutId !== undefined) {
       clearTimeout(timeoutId);
     }
+    // Проигравший промис уже никому не нужен — глушим его rejection,
+    // иначе Node выдаст unhandledRejection после abort.
+    fetchPromise.catch(() => {});
   }
 }
