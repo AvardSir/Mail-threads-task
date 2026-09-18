@@ -396,8 +396,9 @@ describe('fetchMessages', () => {
       };
     });
 
-    afterEach(() => {
-  nock.abortPendingRequests();   // ← гасим хвосты сразу после каждого теста
+afterEach(() => {
+  nock.abortPendingRequests();
+  nock.cleanAll();       // ← добавить: рвём интерсепторы сразу, не дожидаясь beforeEach
 });
 
 

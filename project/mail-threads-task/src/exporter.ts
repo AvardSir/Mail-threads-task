@@ -9,10 +9,9 @@ export interface ExportedMessage {
   external_id: string;
   thread_key: string | null;
   parent_id: string;
-  sent_at: string | null;
-  subject: string | null;
+  sent_at: string;
+  subject: string;
 }
-
 
 
 // ---- 3. Config ----
@@ -26,8 +25,8 @@ const toExported = (row: MessageRow): ExportedMessage => ({
   external_id: row.externalId,
   thread_key: row.threadKey,
   parent_id: row.parentId ?? '',
-  sent_at: row.sentAt ? row.sentAt.toISOString() : null,
-  subject: row.subject,
+  sent_at: row.sentAt ? row.sentAt.toISOString() : 'unknown',
+  subject: row.subject ?? 'unknown',
 });
 
 const serialize = (rows: MessageRow[]): string =>

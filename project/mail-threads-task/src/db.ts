@@ -77,22 +77,41 @@ export const getAllMessages = async (): Promise<MessageRow[]> => {
 };
 
 // ---- 4. Thread/Parent ----
-
 export const updateThreadAndParent = async (
   updates: UpdateThreadInput[],
 ): Promise<void> => {
   if (updates.length === 0) return;
 
-  const values = updates.map(
-    (u) => Prisma.sql`(${u.externalId}, ${u.parentId}, ${u.threadKey})`,
-  );
+  for (const part of chunk(updates, UPDATES_CHUNK_SIZE)) {
+    const values = part.map(
+      (u) => Prisma.sql`(${u.externalId}, ${u.parentId}, ${u.threadKey})`,
+    );
 
-  await prisma.$executeRaw`
-    UPDATE "messages" AS m
-    SET "parentId" = v.parent_id,
-        "threadKey" = v.thread_key
-    FROM (VALUES ${Prisma.join(values)})
-      AS v(external_id, parent_id, thread_key)
-    WHERE m."externalId" = v.external_id
-  `;
+    await prisma.$executeRaw`
+      UPDATE "messages" AS m
+      SET "parentId" = v.parent_id,
+          "threadKey" = v.thread_key
+      FROM (VALUES ${Prisma.join(values)})
+        AS v(external_id, parent_id, thread_key)
+      WHERE m."externalId" = v.external_id
+    `;
+  }
+};
+
+// ---- 5. Private helpers ----
+
+/**
+ * Postgres rejects prepared statements with more than 32 767 bind parameters.
+ * `updateThreadAndParent` uses 3 binds per row (externalId, parentId, threadKey),
+ * so a single UPDATE with more than ~10 922 rows overflows. 5000 rows per chunk
+ * keeps us at 15 000 binds (46 % of the limit) with room for future columns.
+ */
+const UPDATES_CHUNK_SIZE = 5000;
+
+const chunk = <T>(arr: T[], size: number): T[][] => {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
+  return out;
 };

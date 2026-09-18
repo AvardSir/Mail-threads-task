@@ -21,10 +21,10 @@ jest.mock('pino', () => {
   };
   const pinoMock: any = jest.fn(() => mockLogger);
   pinoMock.stdTimeFunctions = {
-    isoTime:   jest.fn(() => ',"time":"2024-01-01T00:00:00.000Z"'),
+    isoTime: jest.fn(() => ',"time":"2024-01-01T00:00:00.000Z"'),
     epochTime: jest.fn(() => ',"time":0'),
-    unixTime:  jest.fn(() => ',"time":0'),
-    nullTime:  jest.fn(() => ''),
+    unixTime: jest.fn(() => ',"time":0'),
+    nullTime: jest.fn(() => ''),
   };
   return pinoMock;
 });
@@ -211,12 +211,12 @@ describe('exporter (T2: task-spec result.jsonl format)', () => {
       expect(obj.sent_at).toBe('2025-04-11T09:23:15.000Z');
     });
 
-    it('C2: sentAt null → null', async () => {
+    it('C2: sentAt null → "unknown" (selfcheck requires non-empty string)', async () => {
       (getAllMessages as jest.Mock).mockResolvedValue([makeRow({ sentAt: null })]);
       await exportAll(outPath);
 
       const obj = await readFirst(outPath);
-      expect(obj.sent_at).toBeNull();
+      expect(obj.sent_at).toBe('unknown');
     });
   });
 
@@ -234,12 +234,12 @@ describe('exporter (T2: task-spec result.jsonl format)', () => {
       expect(obj.subject).toBe('Re: Test');
     });
 
-    it('D2: subject null → null', async () => {
+    it('D2: subject null → "unknown" (selfcheck requires non-empty string)', async () => {
       (getAllMessages as jest.Mock).mockResolvedValue([makeRow({ subject: null })]);
       await exportAll(outPath);
 
       const obj = await readFirst(outPath);
-      expect(obj.subject).toBeNull();
+      expect(obj.subject).toBe('unknown');
     });
   });
 
@@ -330,7 +330,67 @@ describe('exporter (T2: task-spec result.jsonl format)', () => {
       expect(mockLogger.info.mock.calls.length).toBeGreaterThanOrEqual(2);
     });
 
-    
+
+  });
+
+  // =========================================================
+  // G. selfcheck contract (official validator from task authors)
+  // =========================================================
+  //
+  // Официальный selfcheck.js требует, чтобы external_id, thread_key, sent_at
+  // и subject в каждой строке были НЕПУСТЫМИ строками (`length > 0`).
+  // external_id всегда есть (нечего null'ить). thread_key заполняет processor.ts
+  // и в боевых данных null_tk=0. sent_at/subject — приводим null → 'unknown'.
+  //
+  // Тест повторяет эту проверку на нашем выводе, чтобы регрессия ловилась
+  // unit-тестом, а не внешним скриптом.
+  describe('G. selfcheck contract', () => {
+    it('G1: every line has non-empty string in external_id/thread_key/sent_at/subject', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([
+        // все поля заполнены
+        makeRow({
+          id: 1,
+          externalId: '<a@x>',
+          threadKey: 't-1',
+          sentAt: new Date('2025-04-11T09:23:15.000Z'),
+          subject: 'Subject',
+        }),
+        // sent_at = null → 'unknown'
+        makeRow({
+          id: 2,
+          externalId: '<b@x>',
+          threadKey: 't-1',
+          sentAt: null,
+          subject: 'Subject',
+        }),
+        // subject = null → 'unknown'
+        makeRow({
+          id: 3,
+          externalId: '<c@x>',
+          threadKey: 't-1',
+          sentAt: new Date('2025-04-11T09:23:15.000Z'),
+          subject: null,
+        }),
+      ]);
+      await exportAll(outPath);
+
+      const lines = await readLines(outPath);
+      expect(lines).toHaveLength(3);
+
+      for (const line of lines) {
+        const obj = JSON.parse(line);
+        for (const field of ['external_id', 'thread_key', 'sent_at', 'subject']) {
+          expect(typeof obj[field]).toBe('string');
+          expect(obj[field].length).toBeGreaterThan(0);
+        }
+        // parent_id — только тип string, "" разрешён
+        expect(typeof obj.parent_id).toBe('string');
+      }
+
+      // Точечно: null → 'unknown'
+      expect(JSON.parse(lines[1]).sent_at).toBe('unknown');
+      expect(JSON.parse(lines[2]).subject).toBe('unknown');
+    });
   });
 });
 
