@@ -19,20 +19,30 @@ Env	dotenv
 3. 📁 Структура
 project/
 ├── .env                    ← боевой конфиг (в .gitignore)
-├── jest.config.js          ← setupFiles: ['<rootDir>/jest.setup.ts']
-├── jest.setup.ts           ← env-переменные для тестов (в git)
+├── .env.example            ← шаблон (в git)
+├── .dockerignore           ← ✅ Веха 8
+├── Dockerfile              ← ✅ Веха 8
+├── docker-compose.yml      ← ✅ Веха 8 (provider + db + worker + exporter)
+├── docker-compose.dev.yml  ← локальная разработка (Веха 2)
+├── jest.config.js
+├── jest.setup.ts
+├── tsconfig.json
+├── tsconfig.build.json     ← ⚠️ см. §13.6 (если применимо)
+├── scripts/
+│   └── entrypoint.sh       ← ✅ Веха 8 (prisma migrate deploy + exec "$@")
 └── src/
-    ├── client.ts           ← HTTP-клиент (Веха 3) ✅
+    ├── client.ts           ← HTTP-клиент + AbortController (T3)
     ├── client.test.ts      ← ✅
-    ├── prisma.ts           ← shared PrismaClient (Веха 4) ✅
-    ├── db.ts               ← слой БД (Веха 4) ✅
-    ├── db.test.ts          ← ✅
-    ├── worker.ts           ← основной цикл (Веха 5) ✅
-    ├── worker.test.ts      ← ✅
-    ├── processor.ts        ← постобработка (Веха 6) ✅
-    ├── processor.test.ts   ← ✅ 27 тестов
-    ├── exporter.ts         ← экспорт JSONL (Веха 7) ✅
-    └── exporter.test.ts    ← ✅ 18 тестов
+    ├── prisma.ts
+    ├── db.ts
+    ├── db.test.ts
+    ├── worker.ts
+    ├── worker.test.ts
+    ├── processor.ts
+    ├── processor.test.ts
+    ├── exporter.ts
+    ├── exporter.test.ts
+    └── docker.test.ts      ← ✅ Веха 8 (структурные тесты инфры)
 
 4. ⚙️ Конфиг: правила игры
 4.1 Env-переменные читаются один раз при импорте модуля
@@ -59,6 +69,14 @@ MAX_DELAY               = '500'
 TOTAL_OPERATION_TIMEOUT = '5000'
 LOG_LEVEL               = 'silent'
 
+4.3 tsconfig.json и сборка
+jsonc
+// tsconfig.json (для IDE/ts-jest)
+"exclude": ["node_modules", "dist"]           // тесты НЕ исключаем
+Сборка dist/ через npm run build — БЕЗ тестов. Тестовые файлы не должны попадать в образ. Решение: отдельный tsconfig.build.json (если exclude: ["**/*.test.ts"] в основном tsconfig ломает ts-jest — см. §13.6), либо npm run build с --excludeFiles.
+
+Текущее состояние: tsconfig.json c "exclude": ["node_modules", "dist"], tsc собирает src/**/* → dist/, .dockerignore спасает от заноса dist/ в образ. Если тесты попадут в dist/ — пересмотреть.
+
 5. 🌐 Axios: жёсткие правила
 ts
 axios.create({
@@ -83,6 +101,8 @@ code ∈ ECONNABORTED, ETIMEDOUT, ENOTFOUND, ECONNREFUSED	getDelay(attempt, base
 status 3xx (кроме редиректов — их вообще не будет с maxRedirects: 0).
 
 status 4xx, кроме 429.
+
+code === 'ERR_CANCELED' (axios abort по AbortController) — см. §8.1.
 
 Формула задержки
 ts
@@ -113,24 +133,55 @@ timeoutPromise реджектится через config.totalOperationTimeout м
 
 Ограничивает всё: все попытки + все sleep-ы вместе.
 
-Внутренний fetchPromise после этого продолжает жить (это известная особенность Promise.race), но наружу уже ничего не отдаёт.
+8.1. Отмена in-flight axios (мини-веха T3)
+ts
+const controller = new AbortController();
+let timeoutId: NodeJS.Timeout | undefined;
+
+const timeoutPromise = new Promise<never>((_, reject) => {
+  timeoutId = setTimeout(() => {
+    controller.abort();                     // ← обязательно: рвём in-flight axios
+    reject(new Error(`Operation timed out after ${operationTimeout}ms`));
+  }, operationTimeout);
+});
+
+const fetchPromise = doFetch(controller.signal);   // signal → axios.get + sleep
+
+try {
+  return await Promise.race([fetchPromise, timeoutPromise]);
+} finally {
+  if (timeoutId) clearTimeout(timeoutId);
+  fetchPromise.catch(() => {});              // глушим «проигравший» промис
+}
+sleep(ms, signal) — abort-aware: reject'ит сразу, если пришёл abort.
+
+В начале каждой retry-итерации: if (controller.signal.aborted) throw new Error('Operation timed out...').
+
+ERR_CANCELED от axios — не retryable, пробрасывается наружу (не входит в §6-список).
+
+Правило: Promise.race не убивает проигравший промис. Без AbortController в nock-тестах копятся висячие MockHttpSocket (грабли #18).
 
 9. 🧪 Тесты: каноны
 9.1 Настройка describe
 ts
 describe('fetchMessages', () => {
   beforeEach(() => {
-    nock.cleanAll();           // ✅ обязательно
-    nock.disableNetConnect();  // ✅ страховка от реальных запросов
+    nock.abortPendingRequests();   // ← первая строка: чужие висячие сокеты
+    nock.cleanAll();
+    nock.disableNetConnect();
     jest.clearAllMocks();
   });
 
+  afterEach(() => {
+    nock.abortPendingRequests();   // ← обязательно: гасит хвосты сразу
+    nock.cleanAll();
+  });
+
   afterAll(() => {
-  nock.abortPendingRequests();  // ← гасит висячие .delay()-ответы,
-                                //   иначе --runInBand ловит NetConnectNotAllowedError
-  nock.cleanAll();
-  nock.enableNetConnect();
-});
+    nock.abortPendingRequests();
+    nock.cleanAll();
+    nock.enableNetConnect();
+  });
 });
 9.2 Никогда не использовать
 ❌ jest.useFakeTimers() + jest.advanceTimersByTime() — конфликтуют с axios/nock.
@@ -146,7 +197,6 @@ describe('fetchMessages', () => {
    const orig = process.env.X;
    process.env.X = '...';
    try { ... } finally { process.env.X = orig; jest.resetModules(); }
-
 
 9.3 Мок pino — обязательный
 ts
@@ -185,6 +235,7 @@ jest.resetModules();
 | response validation   | 4 кейса из §7                                       |
 | operation timeout     | мок axios с вечно висящим get()                     |
 | max retries exhausted | .times(maxRetries + 1) × 500                        |
+| T1 — timeout cleanup  | clearTimeout в finally, 5 кейсов                    |
 
 10. 📝 Стиль кода
 Только стрелки и async/await, никаких .then().
@@ -222,6 +273,16 @@ jest.resetModules();
 | 15 | processor.ts — чистая функция без БД, HTTP, логгера | `buildUpdates(messages, existingIds) → UpdateThreadInput[]`; self-reference (`m.externalId`) исключается и из parentId, и из union |
 | 16 | Env, переопределённый в тесте через process.env.X = ..., не восстанавливается | оборачивать в try/finally с restore; иначе в --runInBand утекает в следующий файл (client.ts кеширует config при импорте) |
 | 17 | nock .delay(ms) с ms > operation timeout | тест падает по таймауту раньше, чем nock отдаёт ответ → висячий Immediate.cb → NetConnectNotAllowedError в следующем файле; лечится nock.abortPendingRequests() в afterAll |
+| 18 | Promise.race не отменяет in-flight axios | AbortController + controller.abort() в timeout + signal в axios и в sleep + fetchPromise.catch(()=>{}) в finally. Без этого nock оставляет висячие сокеты → Jest did not exit + ENOTFOUND test-provider в следующем файле |
+| 19 | nock.abortPendingRequests() не всегда помогает | Абортит только то, что в очереди nock. Если сокет уже «принят» интерсептором (MockHttpSocket) и axios не закрыл — нужен AbortController на стороне клиента |
+| 20 | nock.disableNetConnect() в beforeEach ловит чужие висячие сокеты | Порядок в beforeEach: abortPendingRequests() → cleanAll() → disableNetConnect(). Иначе чужой сокет из предыдущего файла поймает барьер и уронит suite |
+| 21 | afterEach + abortPendingRequests обязателен в каждом nock-файле | afterAll срабатывает слишком поздно — между ним и следующим файлом есть окно для утечки |
+| 22 | pino.stdTimeFunctions.isoTime в моке | без него модуль падает на импорте |
+| 23 | prisma CLI в dependencies, не devDependencies | entrypoint делает prisma migrate deploy в runtime-стадии, где npm ci --omit=dev |
+| 24 | package.json — чистый JSON, без комментариев | // ← сюда ломает парсинг (EJSONPARSE) |
+| 25 | docker compose run --rm <svc> игнорирует depends_on: service_completed_successfully | Порядок «worker → exporter» обеспечивает README/человек, не compose |
+| 26 | exporter не должен зависеть от provider | Он ходит только в db; PROVIDER_URL в его env — рудимент для общих конфигураций |
+| 27 | worker.runProcessing вызывает exportAll() | by design §14.3. В проде файл наружу отдаёт только служба exporter (bind-mount ./out); worker пишет в свой контейнер. Отражено в README (Веха 10) |
 
 12. 🎓 TL;DR
 Клиент — это один модуль с одной функцией.
@@ -230,6 +291,7 @@ Retry — только для транзиентных ошибок, всё ос
 Тесты — nock + реальные таймеры + маленькие задержки через setup-файл.
 Стиль — строгий TypeScript, явные типы, точные сообщения об ошибках.
 Processor — DSU + скан parentId с конца; никакой БД и логов.
+Operation timeout — AbortController, не только Promise.race (T3).
 
 13. 🧪 TDD-практика (жёсткий протокол)
 
@@ -356,6 +418,20 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
 ('Not implemented') → Red (18/18) → Green (18/18) без единой правки тестов
 на фазе реализации. Ни одного ложного зелёного.
 
+13.6. tsconfig и ts-jest
+────────────────────────
+Если tsconfig.json содержит `"exclude": ["**/*.test.ts"]`, ts-jest может
+компилировать тесты с дефолтными опциями (не проектовыми) — теоретически
+ломает esModuleInterop. На практике у нас это НЕ подтвердилось (тесты
+зелёные и с exclude, и без).
+
+Если в будущем ts-jest начнёт капризничать — паттерн:
+- tsconfig.json — для IDE/ts-jest, exclude: ["node_modules", "dist"]
+  (без **/*.test.ts).
+- tsconfig.build.json — extends первый + "exclude": ["node_modules", "dist",
+  "**/*.test.ts"].
+- package.json: "build": "tsc --project tsconfig.build.json".
+
 ---
 
 14. 🗺 Дорожная карта (вехи)
@@ -372,79 +448,75 @@ TDD идёт ТРЕМЯ ОТДЕЛЬНЫМИ ЗАПРОСАМИ. Никогда 
 | 5   | Основной цикл (worker)          | src/worker.ts, src/worker.test.ts, стабы processor.ts/exporter.ts | ✅      |
 | 6   | Постобработка                   | src/processor.ts, src/processor.test.ts (parent_id, thread_key)   | ✅      |
 | 7   | Экспорт                         | src/exporter.ts → ./out/result.jsonl, src/exporter.test.ts        | ✅      |
-| 8   | Production Docker               | Dockerfile, docker-compose.yml (db + worker + exporter)           | ⏳      |
-| 9   | E2E-прогон                      | Полный цикл: load → process → export                              | ⏳      |
-| 10  | Документация                    | README, инструкция запуска, переменные окружения                  | ⏳      |
+| T1  | Timeout cleanup (techdebt)      | clearTimeout в finally вокруг Promise.race                        | ✅      |
+| T2  | Формат result.jsonl под ТЗ      | snake_case, 5 полей, parent_id null → ""                          | ✅      |
+| T3  | Abort in-flight axios           | AbortController + abort-aware sleep, 0 handles                    | ✅      |
+| 8   | Production Docker               | Dockerfile, .dockerignore, compose (db/worker/exporter), entrypoint | ✅    |
+| 9   | E2E-прогон                      | docker compose up worker → run exporter → selfcheck.js            | ⏳      |
+| 10  | Документация                    | README (CANDIDATE + 7 ответов), .env.example обновить             | ⏳      |
 
 14.1. Текущий статус
 
-- Веха 3 завершена: client.ts реализован, тесты зелёные.
-- Веха 4 завершена: src/prisma.ts, src/db.ts, src/db.test.ts реализованы,
-  все тесты зелёные.
-- Веха 5 завершена: src/worker.ts реализован (16/16 тестов зелёных).
-  Стабы src/processor.ts (buildUpdates) и src/exporter.ts (exportAll)
-  созданы в финальных контрактах §14.4/§14.5 — тела заглушки, наполняются
-  в Вехах 6/7 без переписывания тестов worker.ts.
-  Все 50 тестов (client + db + worker) зелёные.
-  Предсказание подтвердилось на Вехе 6: наполнение processor.ts не потребовало
-  ни одной правки в worker.test.ts (16/16 остались зелёными).
-- Веха 6 завершена: src/processor.ts реализован (27/27 тестов зелёных).
-  Полный прогон — 4 сьюта, 77/77 зелёных (client + db + worker + processor).
-  Реализация: DSU для thread_key (union(child, target) → target становится
-  корнем, links обходятся в обратном порядке), parent_id — скан с конца
-  [references..., inReplyTo], self-reference исключён. Чистая функция без БД,
-  HTTP и логгера. client.ts / db.ts / worker.ts не тронуты.
-- Все ограничения и грабли Вехи 3 зафиксированы в §4–§11 — источник истины
-  для клиента, менять их без причины нельзя.
+- Вехи 3–7 завершены. Все модули реализованы, покрыты тестами.
+  Полный прогон: 5 сьютов, 104/104 зелёных (client + db + worker + processor + exporter).
 
-- Веха 7 завершена: src/exporter.ts реализован (18/18 тестов зелёных в
-  src/exporter.test.ts), стаб заменён на рабочее тело.
-  Полный прогон — 5 сьютов, 95/95 зелёных
-  (client + db + worker + processor + exporter).
-  Контракт: exportAll(outputPath?: string) → Promise<void>, дефолт
-  './out/result.jsonl'; exportAll — чистая библиотечная функция, process.exit
-  только в runCli под require.main === module.
-  Порядок строк = порядок getAllMessages() (id ASC). Пустой результат →
-  файл 0 байт. sentAt: Date → toISOString(), null → null.
-  mkdir(dirname(outputPath), { recursive: true }) перед записью.
-  Экспортируется тип ExportedMessage (7 полей). Логгер —
-  rootLogger.child({ module: 'exporter' }), info на старте/финише, error
-  при падении.
-  Побочная правка: в src/client.ts rootLogger получил export
-  (const → export const), чтобы exporter мог его импортировать.
-  Поведение client.ts не изменилось, client.test.ts зелёный.
-  Coverage по exporter.ts: 96.42% stmts / 85.71% branch / 100% funcs /
-  95.83% lines. Единственная непокрытая ветка — CLI-entrypoint
-  (require.main === module), не покрывается unit-тестами по природе;
-  кандидат на /* istanbul ignore next */ или E2E-покрытие в Вехе 9.
-  Решение по этому пункту отложено.
+- Мини-веха T1 (timeout cleanup) — закрыта: clearTimeout в finally вокруг Promise.race.
+  Побочно: client.test.ts получил try/finally на TOTAL_OPERATION_TIMEOUT +
+  nock.abortPendingRequests() в afterAll.
 
-- Следующий шаг — Веха 8 (production Docker: Dockerfile,
-  docker-compose.yml с db + worker + exporter).
+- Мини-веха T2 (формат result.jsonl под ТЗ) — закрыта:
+  ExportedMessage = 5 полей snake_case в фиксированном порядке:
+  external_id, thread_key, parent_id, sent_at, subject.
+  parentId null → "" (по ТЗ "Пустая строка, если это первое письмо разговора").
+  thread_key / sent_at / subject остаются nullable (null → null).
+  fromAddr / toAddrs / internal id из вывода убраны.
+  exporter.test.ts переписан под новый контракт (22/22).
+  runCli error-logging coverage восстановлена в блоке F7/F8.
 
-Открытый техдолг (не блокирует вехи, но помнить):
-- ✅ client.ts: timeoutPromise очищается через clearTimeout в finally
-  вокруг Promise.race (мини-веха T1, отдельный коммит).
-  Симптом "did not exit one second after test run" закрыт.
-  Побочно: §6 operation timeout в client.test.ts восстановлен
-  через try/finally (process.env.TOTAL_OPERATION_TIMEOUT), а
-  afterAll файла получил nock.abortPendingRequests() +
-  nock.cleanAll() перед enableNetConnect() — иначе --runInBand
-  ловил NetConnectNotAllowedError от висячего nock-ответа T1.4.
+- Мини-веха T3 (AbortController) — закрыта:
+  Проблема: Promise.race не убивает in-flight axios → 8 висячих handle
+  (HTTPINCOMINGMESSAGE / HTTPCLIENTREQUEST / Timeout), из-за чего:
+    - Jest "did not exit one second after test run";
+    - при --runInBand следующий файл (worker.test.ts) ловил
+      NetConnectNotAllowedError → getaddrinfo ENOTFOUND test-provider
+      (грабли #18–#21).
+  Решение: AbortController в fetchMessages; controller.abort() при срабатывании
+  operation timeout; signal прокинут в axios.get и в abort-aware sleep();
+  fetchPromise.catch(()=>{}) в finally (rejection уже доставлен через race).
+  ERR_CANCELED — не retryable (§6).
+  Дополнительно в тестах: nock.abortPendingRequests() первым в beforeEach
+  worker.test.ts и в afterEach client.test.ts + worker.test.ts.
+  Итог: 0 open handles, exit code 0, без forceExit.
 
-- Следующий шаг — Веха 8 (production Docker: Dockerfile,
-  docker-compose.yml с db + worker + exporter).
-- Параллельный запуск runWorker в двух процессах не защищён
-  (нет распределённой блокировки по stage). Отметить в README (Веха 10).
+- Веха 8 (production Docker) — закрыта:
+  Dockerfile (multi-stage: builder → runtime на node:20-bookworm-slim,
+  non-root USER node, tini, без CMD в образе).
+  .dockerignore (node_modules, dist, coverage, .git, .env, out, tests, *.test.ts;
+  prisma/ НЕ исключён).
+  scripts/entrypoint.sh (prisma migrate deploy && exec "$@").
+  docker-compose.yml — provider + db + worker + exporter:
+    db: postgres:15, healthcheck pg_isready, named volume postgres_data,
+        порт наружу не проброшен;
+    worker: build: ., image: mail-threads-app:latest,
+            command: node dist/worker.js,
+            depends_on: db + provider (оба service_healthy), restart: "no",
+            env_file: .env + override PROVIDER_URL/DATABASE_URL/таймауты;
+    exporter: тот же image, command: node dist/exporter.js,
+              depends_on: db (service_healthy), restart: "no",
+              bind-mount ./out:/app/out.
+  src/docker.test.ts — 25 структурных тестов (A/B/C/D/E) + F1 smoke (skip).
+  Побочные правки: prisma перенесён в dependencies (нужен в runtime);
+  package.json devDeps: js-yaml + @types/js-yaml.
 
-- Локально рекомендуется `npm test -- --runInBand`, пока db.test.ts
-  и worker.test.ts делят одну БД — иначе гонка на TRUNCATE.
+- Полный прогон: 6 сьютов, 130 тестов (129 passed, 1 skipped, 0 open handles,
+  без forceExit).
 
-- exporter.ts: ветка require.main === module не покрыта unit-тестами
-  (CLI-entrypoint). Не блокирует, но перед Вехой 9 (E2E) стоит либо
-  пометить /* istanbul ignore next */, либо покрыть E2E.
-  В worker.ts аналогичная ветка уже помечена /* istanbul ignore next */
-  в мини-вехе T1.
+- Следующий шаг — Веха 9 (E2E):
+    docker compose down -v
+    docker compose up worker       # должен завершиться exit 0
+    docker compose run --rm exporter
+    node selfcheck.js out/result.jsonl
+    закоммитить out/result.jsonl в репо.
 
 14.2. Что должно быть в Вехе 4 (db.ts)
 Публичный контракт (обязателен, из §3.1 исходного ТЗ):
@@ -534,26 +606,34 @@ MessageRow (источник истины для processor):
 
 14.5. Что должно быть в Вехе 7 (exporter.ts)
 - Читает getAllMessages().
-- Пишет ./out/result.jsonl: одна строка = один JSON-объект с полями
-  externalId, parentId, threadKey, subject, fromAddr, toAddrs, sentAt.
-- Порядок строк детерминирован (по externalId или по id).
-- Ошибки записи — фатальны (exit code ≠ 0).
+- Пишет ./out/result.jsonl: одна строка = один JSON-объект.
+- Порядок строк = порядок getAllMessages() (id ASC).
+
 Статус: ✅ реализовано в src/exporter.ts, покрыто тестами в src/exporter.test.ts
-(18/18 зелёных).
-Контракт финальный: exportAll(outputPath?: string) → Promise<void>.
-Дополнительно экспортируются: ExportedMessage (7 полей), runCli.
+(T2: 22/22 зелёных, после переработки формата под ТЗ).
+
+Контракт финальный (после T2): exportAll(outputPath?: string) → Promise<void>.
+Дополнительно экспортируются: ExportedMessage, runCli.
+
+Формат строки JSONL (5 полей, snake_case, фиксированный порядок):
+{"external_id":"...","thread_key":"...","parent_id":"...","sent_at":"...","subject":"..."}
+
+Тип ExportedMessage:
+  external_id: string;
+  thread_key: string | null;
+  parent_id: string;           // "" если нет родителя
+  sent_at: string | null;
+  subject: string | null;
 
 Уточнения, зафиксированные при реализации:
-- Порядок строк — как отдал getAllMessages() (id ASC). Сортировка —
-  ответственность db-слоя, не exporter.
-- Пустой результат → файл создаётся, 0 байт.
-- sentAt: Date → Date.toISOString(), null → null. Тип ExportedMessage.sentAt
-  = string | null.
+- parentId null → "" (по ТЗ: "Пустая строка, если это первое письмо разговора").
+- sentAt: Date → Date.toISOString(), null → null.
+- subject / threadKey: null → null (nullable по ТЗ "в том виде, в котором пришли").
+- Порядок полей в JSON фиксирован, задаётся порядком ключей в литерале.
+- fromAddr / toAddrs / internal id из вывода убраны.
 - mkdir(dirname(outputPath), { recursive: true }) перед writeFile.
 - Файл терминирован \n (включая последнюю строку).
-- Поля JSON — фиксированный порядок: externalId, parentId, threadKey,
-  subject, fromAddr, toAddrs, sentAt.
-- id (internal PK) в JSONL не попадает.
+- Пустой результат → файл 0 байт.
 - Тесты: реальная ФС в os.tmpdir() + уникальная подпапка на тест,
   getAllMessages мокается, fs/promises частично мокается для D1/D2.
   pino мокается стандартным моком §9.3.
@@ -563,3 +643,69 @@ MessageRow (источник истины для processor):
 - В db.ts не добавлять retry или HTTP — только Prisma.
 - В worker.ts не добавлять DSU или парсинг — это processor.ts.
 - В processor.ts не ходить в БД напрямую — принимать данные аргументами.
+
+14.7. Контракт Вехи 8 (артефакты)
+
+docker-compose.yml (финальные фиксированные имена):
+- provider — образ gitea.teamlead.one/armanteam_public/mail-provider:1,
+  healthcheck через fetch /v1/metrics, порт 8080.
+- db — postgres:15, user/pass/db = postgres/postgres/mailthreads,
+  named volume postgres_data, порт наружу не пробрасывать.
+- worker — docker compose up worker, exit 0.
+- exporter — docker compose run --rm exporter, пишет ./out/result.jsonl.
+
+Общие правила:
+- worker и exporter делят один build: . + image: mail-threads-app:latest.
+- env_file: .env — источник CANDIDATE и прочих.
+- environment: — override для compose-специфичных значений:
+  PROVIDER_URL: http://provider:8080, DATABASE_URL: ...@db:5432/...,
+  таймауты и LOG_LEVEL.
+- exporter не зависит от provider — только от db.
+- out/ — bind mount ./out:/app/out у exporter'а. Worker — без mount
+  (пишет в свой контейнер, не наружу).
+
+Dockerfile:
+- Multi-stage builder → runtime.
+- Финальная стадия — USER node.
+- ENTRYPOINT ["tini", "--", "/app/scripts/entrypoint.sh"].
+- Без CMD — команды задаются в compose.
+- npm ci в builder, npm ci --omit=dev в runtime + prisma generate.
+- npx prisma generate в обеих стадиях (или копирование из builder).
+
+scripts/entrypoint.sh:
+  #!/bin/sh
+  set -e
+  npx prisma migrate deploy
+  exec "$@"
+
+14.8. Открытый техдолг
+
+- ✅ Закрыт: T1 (clearTimeout), T2 (формат), T3 (AbortController + handles).
+- ⏳ Веха 9: E2E-прогон (docker compose up worker → run exporter → selfcheck.js)
+  — не выполнен.
+- ⏳ Веха 10: README (первая строка CANDIDATE; 7 вопросов ТЗ); обновление
+  .env.example (DATABASE_URL, POSTGRES_*, таймауты).
+- ⚠️ worker.runProcessing вызывает exportAll(). Решено оставить (ТЗ не запрещает,
+  тесты worker 16/16 зелёные). В README (Веха 10) отразить в ответе на вопрос
+  «Что решили не усложнять».
+- ⚠️ Параллельный запуск worker в двух процессах не защищён распределённой
+  блокировкой по stage. Отметить в README (Веха 10).
+- ⚠️ tsconfig.json без exclude: ["**/*.test.ts"] — сборка tsc затянет *.test.ts
+  в dist/. Сейчас спасает .dockerignore. Если понадобится чистый dist/ —
+  завести tsconfig.build.json.
+- ⚠️ Ветка require.main === module в exporter.ts не покрыта unit-тестами
+  (/* istanbul ignore next */). Норм, E2E покроет.
+- ⚠️ out/ в .gitignore? Проверить, что out/result.jsonl не игнорируется —
+  ТЗ требует файл в репо.
+
+14.9. Тесты, финальный прогон
+
+  Test Suites: 6 passed, 6 total
+  Tests:       1 skipped, 129 passed, 130 total
+  Time:        ~8 s
+  Exit:        0 (без forceExit, без open handles)
+
+- 1 skipped: F1: docker compose config — describe.skip, smoke, требует Docker CLI.
+- Полезные флаги локально: npm test -- --runInBand (db.test.ts и worker.test.ts
+  делят БД).
+- --detectOpenHandles — 0 handles (проверено после T3).
