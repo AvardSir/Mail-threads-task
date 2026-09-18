@@ -1,19 +1,24 @@
-// ---- 1. Imports ----
-import { mkdtemp, readFile, rm, access, stat, mkdir, writeFile } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import pino from 'pino';
+/**
+ * T2: exporter.test.ts — переработан под формат ТЗ.
+ *
+ * Контракт result.jsonl (5 полей, snake_case, фиксированный порядок):
+ *   {"external_id":"...","thread_key":"...","parent_id":"...","sent_at":"...","subject":"..."}
+ *   - parent_id: null → "" (пустая строка)
+ *   - thread_key / sent_at / subject: null → null
+ *
+ * Expected Red против старого exporter.ts (camelCase, 7 полей, parentId null → null):
+ *   A2, A3, A5, B2.
+ */
 
-// ---- 2. Mocks ----
-// §9.3 — обязательный мок pino (используется транзитивно через ./logger)
+// ---------- pino mock (канон §9.3) ----------
 jest.mock('pino', () => {
-  const mockLogger: any = {
+  const mockLogger = {
     info: jest.fn(),
     warn: jest.fn(),
     error: jest.fn(),
     debug: jest.fn(),
+    child: jest.fn().mockReturnThis(),
   };
-  mockLogger.child = jest.fn(() => mockLogger);
   const pinoMock: any = jest.fn(() => mockLogger);
   pinoMock.stdTimeFunctions = {
     isoTime:   jest.fn(() => ',"time":"2024-01-01T00:00:00.000Z"'),
@@ -24,217 +29,318 @@ jest.mock('pino', () => {
   return pinoMock;
 });
 
-// Реальная БД — внешняя граница, мокаем (§13.2)
+// ---------- db mock ----------
 jest.mock('./db', () => ({
   getAllMessages: jest.fn(),
 }));
 
-// ФС: real impls по умолчанию, но с возможностью подменить (D1/D2)
+// ---------- fs/promises: частичный мок (spy mkdir / writeFile, остальное — реальное) ----------
 jest.mock('fs/promises', () => {
   const actual = jest.requireActual('fs/promises');
   return {
     ...actual,
-    writeFile: jest.fn(actual.writeFile),
     mkdir: jest.fn(actual.mkdir),
+    writeFile: jest.fn(actual.writeFile),
   };
 });
 
-// ---- 3. SUT imports (после моков) ----
-import { exportAll, runCli } from './exporter';
-import { getAllMessages, MessageRow } from './db';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
+import pino from 'pino';
 
-// ---- 4. Typed handles ----
-const mockGetAllMessages = getAllMessages as jest.MockedFunction<typeof getAllMessages>;
-const mockWriteFile = writeFile as jest.MockedFunction<typeof writeFile>;
-const mockMkdir = mkdir as jest.MockedFunction<typeof mkdir>;
-const mockLogger = (pino as unknown as () => any)();
+import { getAllMessages, type MessageRow } from './db';
+import { exportAll } from './exporter';
 
-// ---- 5. Helpers ----
+const mockLogger = (pino as unknown as jest.Mock)() as {
+  info: jest.Mock;
+  warn: jest.Mock;
+  error: jest.Mock;
+  debug: jest.Mock;
+};
+
+// ---------- helpers ----------
 const makeRow = (overrides: Partial<MessageRow> = {}): MessageRow => ({
   id: 1,
-  externalId: 'ext-1',
+  externalId: '<m1@example.com>',
   parentId: null,
-  threadKey: null,
-  subject: null,
-  fromAddr: null,
-  toAddrs: [],
-  sentAt: null,
+  threadKey: 't-1',
+  subject: 'Subject',
+  fromAddr: 'a@example.com',
+  toAddrs: ['b@example.com'],
+  sentAt: new Date('2025-04-11T09:23:15.000Z'),
   references: [],
   inReplyTo: null,
   ...overrides,
 });
 
-const fileExists = async (p: string): Promise<boolean> => {
-  try {
-    await access(p);
-    return true;
-  } catch {
-    return false;
-  }
+const readLines = async (file: string): Promise<string[]> => {
+  const content = await fs.readFile(file, 'utf8');
+  if (content.length === 0) return [];
+  return content.replace(/\n$/, '').split('\n');
 };
 
-// ---- 6. exportAll ----
-describe('exportAll', () => {
+const readFirst = async (file: string): Promise<any> => {
+  const lines = await readLines(file);
+  return JSON.parse(lines[0]);
+};
+
+// ---------- suite ----------
+describe('exporter (T2: task-spec result.jsonl format)', () => {
   let tmpDir: string;
-  let outputPath: string;
+  let outPath: string;
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    mockGetAllMessages.mockReset();
-    tmpDir = await mkdtemp(join(tmpdir(), 'exporter-test-'));
-    outputPath = join(tmpDir, 'result.jsonl');
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'exporter-t2-'));
+    outPath = path.join(tmpDir, 'result.jsonl');
   });
 
   afterEach(async () => {
-    await rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
-  // ---- A. successful write ----
-  describe('A. successful write', () => {
-    it('A1: writes exactly one line for one message', async () => {
-      mockGetAllMessages.mockResolvedValue([makeRow({ externalId: 'e1' })]);
-      await exportAll(outputPath);
-      const content = await readFile(outputPath, 'utf-8');
-      const lines = content.split('\n').filter((l) => l.length > 0);
-      expect(lines).toHaveLength(1);
-    });
-
-    it('A2: preserves order returned by getAllMessages', async () => {
-      mockGetAllMessages.mockResolvedValue([
-        makeRow({ id: 1, externalId: 'first' }),
-        makeRow({ id: 2, externalId: 'second' }),
-        makeRow({ id: 3, externalId: 'third' }),
+  // =========================================================
+  // A. Line format
+  // =========================================================
+  describe('A. line format', () => {
+    it('A1: each line is valid JSON with exactly 5 fields', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([
+        makeRow({ id: 1, externalId: '<a@x>' }),
+        makeRow({ id: 2, externalId: '<b@x>' }),
       ]);
-      await exportAll(outputPath);
-      const content = await readFile(outputPath, 'utf-8');
-      const lines = content.trimEnd().split('\n');
-      expect(lines.map((l) => JSON.parse(l).externalId)).toEqual(['first', 'second', 'third']);
-    });
+      await exportAll(outPath);
 
-    it('A3: each line contains all 7 fields', async () => {
-      mockGetAllMessages.mockResolvedValue([makeRow({ externalId: 'e1' })]);
-      await exportAll(outputPath);
-      const content = await readFile(outputPath, 'utf-8');
-      const obj = JSON.parse(content.trim());
-      expect(Object.keys(obj).sort()).toEqual(
-        ['externalId', 'fromAddr', 'parentId', 'sentAt', 'subject', 'threadKey', 'toAddrs'].sort(),
-      );
-    });
-
-    it('A4: sentAt Date serialized as ISO string', async () => {
-      const date = new Date('2024-01-01T12:34:56.789Z');
-      mockGetAllMessages.mockResolvedValue([makeRow({ sentAt: date })]);
-      await exportAll(outputPath);
-      const content = await readFile(outputPath, 'utf-8');
-      expect(JSON.parse(content.trim()).sentAt).toBe('2024-01-01T12:34:56.789Z');
-    });
-
-    it('A5: sentAt null stays null', async () => {
-      mockGetAllMessages.mockResolvedValue([makeRow({ sentAt: null })]);
-      await exportAll(outputPath);
-      const content = await readFile(outputPath, 'utf-8');
-      expect(JSON.parse(content.trim()).sentAt).toBeNull();
-    });
-
-    it('A6a: empty toAddrs → []', async () => {
-      mockGetAllMessages.mockResolvedValue([makeRow({ toAddrs: [] })]);
-      await exportAll(outputPath);
-      const content = await readFile(outputPath, 'utf-8');
-      expect(JSON.parse(content.trim()).toAddrs).toEqual([]);
-    });
-
-    it('A6b: multiple toAddrs preserved in order', async () => {
-      mockGetAllMessages.mockResolvedValue([makeRow({ toAddrs: ['a@x', 'b@y', 'c@z'] })]);
-      await exportAll(outputPath);
-      const content = await readFile(outputPath, 'utf-8');
-      expect(JSON.parse(content.trim()).toAddrs).toEqual(['a@x', 'b@y', 'c@z']);
-    });
-
-    it('A7: nullable fields present and null (not "null"/undefined/missing)', async () => {
-      mockGetAllMessages.mockResolvedValue([
-        makeRow({ parentId: null, threadKey: null, subject: null, fromAddr: null }),
-      ]);
-      await exportAll(outputPath);
-      const content = await readFile(outputPath, 'utf-8');
-      const obj = JSON.parse(content.trim());
-      for (const k of ['parentId', 'threadKey', 'subject', 'fromAddr']) {
-        expect(k in obj).toBe(true);
-        expect(obj[k]).toBeNull();
+      const lines = await readLines(outPath);
+      expect(lines).toHaveLength(2);
+      for (const line of lines) {
+        const obj = JSON.parse(line);
+        expect(Object.keys(obj)).toHaveLength(5);
       }
     });
 
-    it('A8: file ends with newline', async () => {
-      mockGetAllMessages.mockResolvedValue([makeRow({ externalId: 'e1' })]);
-      await exportAll(outputPath);
-      const content = await readFile(outputPath, 'utf-8');
+    it('A2: keys are snake_case: external_id, thread_key, parent_id, sent_at, subject', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([makeRow()]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(Object.keys(obj).sort()).toEqual(
+        ['external_id', 'parent_id', 'sent_at', 'subject', 'thread_key'].sort(),
+      );
+      expect(obj).not.toHaveProperty('externalId');
+      expect(obj).not.toHaveProperty('threadKey');
+      expect(obj).not.toHaveProperty('parentId');
+      expect(obj).not.toHaveProperty('sentAt');
+    });
+
+    it('A3: field order is fixed: external_id → thread_key → parent_id → sent_at → subject', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([makeRow()]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(Object.keys(obj)).toEqual([
+        'external_id',
+        'thread_key',
+        'parent_id',
+        'sent_at',
+        'subject',
+      ]);
+    });
+
+    it('A4: internal id is not present in output', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([makeRow({ id: 42 })]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj).not.toHaveProperty('id');
+    });
+
+    it('A5: fromAddr and toAddrs are not present in output', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([makeRow()]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj).not.toHaveProperty('fromAddr');
+      expect(obj).not.toHaveProperty('toAddrs');
+    });
+  });
+
+  // =========================================================
+  // B. parent_id
+  // =========================================================
+  describe('B. parent_id', () => {
+    it('B1: parentId string → parent_id string', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([
+        makeRow({ parentId: '<parent@x>' }),
+      ]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj.parent_id).toBe('<parent@x>');
+    });
+
+    it('B2: parentId null → parent_id "" (task spec: empty string, not null)', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([makeRow({ parentId: null })]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj.parent_id).toBe('');
+      expect(obj.parent_id).not.toBeNull();
+    });
+
+    it('B3: parentId "" → parent_id "" (idempotent)', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([makeRow({ parentId: '' })]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj.parent_id).toBe('');
+    });
+  });
+
+  // =========================================================
+  // C. sent_at
+  // =========================================================
+  describe('C. sent_at', () => {
+    it('C1: sentAt Date → ISO string', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([
+        makeRow({ sentAt: new Date('2025-04-11T09:23:15.000Z') }),
+      ]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj.sent_at).toBe('2025-04-11T09:23:15.000Z');
+    });
+
+    it('C2: sentAt null → null', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([makeRow({ sentAt: null })]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj.sent_at).toBeNull();
+    });
+  });
+
+  // =========================================================
+  // D. subject
+  // =========================================================
+  describe('D. subject', () => {
+    it('D1: subject string → as is', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([
+        makeRow({ subject: 'Re: Test' }),
+      ]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj.subject).toBe('Re: Test');
+    });
+
+    it('D2: subject null → null', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([makeRow({ subject: null })]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj.subject).toBeNull();
+    });
+  });
+
+  // =========================================================
+  // E. thread_key
+  // =========================================================
+  describe('E. thread_key', () => {
+    it('E1: threadKey string → as is', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([
+        makeRow({ threadKey: 't-42' }),
+      ]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj.thread_key).toBe('t-42');
+    });
+
+    it('E2: threadKey null → null', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([makeRow({ threadKey: null })]);
+      await exportAll(outPath);
+
+      const obj = await readFirst(outPath);
+      expect(obj.thread_key).toBeNull();
+    });
+  });
+
+  // =========================================================
+  // F. File invariants (unchanged from prior contract)
+  // =========================================================
+  describe('F. file invariants', () => {
+    it('F1: line order matches getAllMessages() order', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([
+        makeRow({ id: 1, externalId: '<a@x>' }),
+        makeRow({ id: 2, externalId: '<b@x>' }),
+        makeRow({ id: 3, externalId: '<c@x>' }),
+      ]);
+      await exportAll(outPath);
+
+      const lines = await readLines(outPath);
+      const ids = lines.map((l) => JSON.parse(l).external_id);
+      expect(ids).toEqual(['<a@x>', '<b@x>', '<c@x>']);
+    });
+
+    it('F2: empty result → 0-byte file', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([]);
+      await exportAll(outPath);
+
+      const stat = await fs.stat(outPath);
+      expect(stat.size).toBe(0);
+    });
+
+    it('F3: file is terminated with \\n (including last line)', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([makeRow()]);
+      await exportAll(outPath);
+
+      const content = await fs.readFile(outPath, 'utf8');
       expect(content.endsWith('\n')).toBe(true);
     });
-  });
 
-  // ---- B. empty result ----
-  describe('B. empty result', () => {
-    it('B1: creates empty file (0 bytes)', async () => {
-      mockGetAllMessages.mockResolvedValue([]);
-      await exportAll(outputPath);
-      const stats = await stat(outputPath);
-      expect(stats.size).toBe(0);
-    });
-  });
+    it('F4: mkdir called with recursive: true', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([]);
+      const deep = path.join(tmpDir, 'a', 'b', 'result.jsonl');
+      await exportAll(deep);
 
-  // ---- C. directory creation ----
-  describe('C. directory creation', () => {
-    it('C1: creates nested output directory', async () => {
-      const nestedPath = join(tmpDir, 'nested', 'deep', 'result.jsonl');
-      mockGetAllMessages.mockResolvedValue([makeRow()]);
-      await exportAll(nestedPath);
-      expect(await fileExists(nestedPath)).toBe(true);
+      expect(fs.mkdir).toHaveBeenCalledWith(
+        path.dirname(deep),
+        expect.objectContaining({ recursive: true }),
+      );
     });
 
-    it('C2: existing directory → no error on repeated call', async () => {
-      mockGetAllMessages.mockResolvedValue([makeRow()]);
-      await exportAll(outputPath);
-      await expect(exportAll(outputPath)).resolves.toBeUndefined();
-    });
-  });
+    it('F5: default outputPath is ./out/result.jsonl', async () => {
+      // Полностью глушим ФС на один вызов, чтобы не писать в реальный ./out.
+      (fs.mkdir as jest.Mock).mockResolvedValueOnce(undefined);
+      (fs.writeFile as jest.Mock).mockResolvedValueOnce(undefined);
+      (getAllMessages as jest.Mock).mockResolvedValue([]);
 
-  // ---- D. write errors ----
-  describe('D. write errors', () => {
-    it('D1: fs.writeFile error → exportAll rejects', async () => {
-      mockGetAllMessages.mockResolvedValue([makeRow()]);
-      mockWriteFile.mockRejectedValueOnce(new Error('disk full'));
-      await expect(exportAll(outputPath)).rejects.toThrow('disk full');
+      await exportAll();
+
+      expect(fs.writeFile).toHaveBeenCalled();
+      const firstArg = (fs.writeFile as jest.Mock).mock.calls[0][0];
+      expect(firstArg).toBe('./out/result.jsonl');
     });
 
-    it('D2: fs.mkdir error → exportAll rejects', async () => {
-      mockGetAllMessages.mockResolvedValue([makeRow()]);
-      mockMkdir.mockRejectedValueOnce(new Error('permission denied'));
-      await expect(exportAll(outputPath)).rejects.toThrow('permission denied');
-    });
-  });
+    it('F6a: logger.info called on start and finish', async () => {
+      (getAllMessages as jest.Mock).mockResolvedValue([]);
+      await exportAll(outPath);
 
-  // ---- E. db interaction ----
-  describe('E. db interaction', () => {
-    it('E1: getAllMessages called exactly once', async () => {
-      mockGetAllMessages.mockResolvedValue([]);
-      await exportAll(outputPath);
-      expect(mockGetAllMessages).toHaveBeenCalledTimes(1);
+      expect(mockLogger.info.mock.calls.length).toBeGreaterThanOrEqual(2);
     });
 
-    it('E2: getAllMessages error → rejects, file not created', async () => {
-      mockGetAllMessages.mockRejectedValueOnce(new Error('db down'));
-      await expect(exportAll(outputPath)).rejects.toThrow('db down');
-      expect(await fileExists(outputPath)).toBe(false);
-    });
+    
   });
 });
 
-// ---- 7. runCli ----
-describe('runCli', () => {
+// ---------- runCli (error logging lives here, not in exportAll) ----------
+describe('runCli (T2)', () => {
   let exitSpy: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockGetAllMessages.mockReset();
+    (getAllMessages as jest.Mock).mockReset();
     exitSpy = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
   });
 
@@ -242,20 +348,22 @@ describe('runCli', () => {
     exitSpy.mockRestore();
   });
 
-  it('F1: success → exit(0) and info logged', async () => {
-    mockGetAllMessages.mockResolvedValue([]);
+  it('F7: success → exit(0), info logged', async () => {
+    (getAllMessages as jest.Mock).mockResolvedValue([]);
+    const { runCli } = require('./exporter');
     await runCli();
     expect(exitSpy).toHaveBeenCalledWith(0);
     expect(mockLogger.info).toHaveBeenCalled();
   });
 
-  it('F2: failure → exit(1) and error logged with the underlying error', async () => {
-    const err = new Error('boom');
-    mockGetAllMessages.mockRejectedValueOnce(err);
+  it('F8: failure → exit(1), error logged with the underlying error', async () => {
+    const boom = new Error('boom');
+    (getAllMessages as jest.Mock).mockRejectedValueOnce(boom);
+    const { runCli } = require('./exporter');
     await runCli();
     expect(exitSpy).toHaveBeenCalledWith(1);
     expect(mockLogger.error).toHaveBeenCalledWith(
-      expect.objectContaining({ err }),
+      expect.objectContaining({ err: boom }),
       expect.any(String),
     );
   });

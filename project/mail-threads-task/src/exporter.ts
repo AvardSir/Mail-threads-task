@@ -6,14 +6,14 @@ import { rootLogger } from './client';
 
 // ---- 2. Public types ----
 export interface ExportedMessage {
-  externalId: string;
-  parentId: string | null;
-  threadKey: string | null;
+  external_id: string;
+  thread_key: string | null;
+  parent_id: string;
+  sent_at: string | null;
   subject: string | null;
-  fromAddr: string | null;
-  toAddrs: string[];
-  sentAt: string | null; // ISO 8601 or null
 }
+
+
 
 // ---- 3. Config ----
 const DEFAULT_OUTPUT_PATH = './out/result.jsonl';
@@ -23,13 +23,11 @@ const logger = rootLogger.child({ module: 'exporter' });
 
 // ---- 5. Helpers ----
 const toExported = (row: MessageRow): ExportedMessage => ({
-  externalId: row.externalId,
-  parentId: row.parentId,
-  threadKey: row.threadKey,
+  external_id: row.externalId,
+  thread_key: row.threadKey,
+  parent_id: row.parentId ?? '',
+  sent_at: row.sentAt ? row.sentAt.toISOString() : null,
   subject: row.subject,
-  fromAddr: row.fromAddr,
-  toAddrs: row.toAddrs,
-  sentAt: row.sentAt ? row.sentAt.toISOString() : null,
 });
 
 const serialize = (rows: MessageRow[]): string =>
